@@ -37,6 +37,14 @@ public sealed class GraphBatch
     }
 
     public bool HasNode(string label, string key) => _nodes.ContainsKey((label, key));
+
+    /// <summary>Removes edges whose endpoints were never declared (e.g. calls into source-generated code). Returns how many.</summary>
+    public int PruneDanglingEdges()
+    {
+        var dangling = _edges.Keys.Where(e => !HasNode(e.FromLabel, e.FromKey) || !HasNode(e.ToLabel, e.ToKey)).ToList();
+        foreach (var e in dangling) _edges.Remove(e);
+        return dangling.Count;
+    }
 }
 
 public readonly record struct EdgeId(string Type, string FromLabel, string FromKey, string ToLabel, string ToKey);

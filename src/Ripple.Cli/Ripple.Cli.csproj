@@ -16,4 +16,8 @@
     <PackageReference Include="Microsoft.Build.Framework" Version="17.11.48" ExcludeAssets="runtime" PrivateAssets="all" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="../../ripple.eshop.json" Link="ripple.eshop.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
