@@ -1,0 +1,31 @@
+From ccbac459e018d86070aab7c57d40fa1989a6a531 Mon Sep 17 00:00:00 2001
+From: Hemanth krishna <hemanthkrishna9@gmail.com>
+Date: Wed, 14 Oct 2026 18:37:30 +0000
+Subject: [PATCH] Rename OrderStockItem.Units to Quantity
+
+---
+ ...rderStatusChangedToAwaitingValidationIntegrationEvent.cs | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/Ordering.API/Application/IntegrationEvents/Events/OrderStatusChangedToAwaitingValidationIntegrationEvent.cs b/src/Ordering.API/Application/IntegrationEvents/Events/OrderStatusChangedToAwaitingValidationIntegrationEvent.cs
+index a7d7322..e2ce1bd 100644
+--- a/src/Ordering.API/Application/IntegrationEvents/Events/OrderStatusChangedToAwaitingValidationIntegrationEvent.cs
++++ b/src/Ordering.API/Application/IntegrationEvents/Events/OrderStatusChangedToAwaitingValidationIntegrationEvent.cs
+@@ -23,11 +23,11 @@ public record OrderStatusChangedToAwaitingValidationIntegrationEvent : Integrati
+ public record OrderStockItem
+ {
+     public int ProductId { get; }
+-    public int Units { get; }
++    public int Quantity { get; }
+ 
+-    public OrderStockItem(int productId, int units)
++    public OrderStockItem(int productId, int quantity)
+     {
+         ProductId = productId;
+-        Units = units;
++        Quantity = quantity;
+     }
+ }
+-- 
+2.43.0
+

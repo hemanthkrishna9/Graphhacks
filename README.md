@@ -457,8 +457,9 @@ dotnet run --project src/Ripple.Cli -- ingest  --repo ../eshop          # build 
 dotnet run --project src/Ripple.Cli -- check                            # contract checks on the whole repo
 dotnet run --project src/Ripple.Cli -- selfcheck                        # EXPLAIN every query (see FalkorDB notes)
 
-# Review a change: base vs head, markdown PR comment
-dotnet run --project src/Ripple.Cli -- analyze --repo ../eshop --base main --head my-branch --markdown comment.md
+# Review a change: base vs head, markdown PR comment. The demo change is in docs/demo-rename-units.patch:
+git -C ../eshop checkout -b demo/rename-units && git -C ../eshop am "$PWD/docs/demo-rename-units.patch" && git -C ../eshop checkout main
+dotnet run --project src/Ripple.Cli -- analyze --repo ../eshop --base main --head demo/rename-units --markdown comment.md
 
 # Benchmark
 dotnet run --project src/Ripple.Cli -- eval --repo ../eshop --out eval
