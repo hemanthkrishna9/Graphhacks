@@ -1,0 +1,33 @@
+# Example: run Ripple on every pull request and post its report as a comment.
+# Copy to .github/workflows/ripple.yml in the repository you want reviewed (not this one).
+name: ripple
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  ripple:
+    runs-on: ubuntu-latest
+    services:
+      falkordb:
+        image: falkordb/falkordb@sha256:107455e862a824e45e8e9f5a7fbfdf5e00a08b14e13eae2577c72fd9e3f59ba6
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, path: app }
+      - uses: actions/checkout@v4
+        with: { repository: hemanthkrishna9/Graphhacks, path: ripple }
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: "10.0.x" }
+      - name: Analyze
+        run: |
+          dotnet run --project ripple/src/Ripple.Cli -- analyze --repo app \
+            --base origin/${{ github.base_ref }} --head ${{ github.event.pull_request.head.sha }} \
+            --config ripple/ripple.eshop.json --markdown comment.md \
+            --repo-url ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.event.pull_request.head.sha }} || true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # optional: model-written explanations
+      - name: Comment
+        run: gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body-file comment.md
+        env:
+          GH_TOKEN: ${{ github.token }}

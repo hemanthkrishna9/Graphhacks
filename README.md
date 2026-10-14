@@ -405,12 +405,15 @@ dotnet run --project src/Ripple.Cli -- eval --repo ../eshop --out eval
 
 ### MCP server
 
+Build it once (`dotnet build src/Ripple.Mcp -c Release`), then point your MCP client at the DLL. (Not `dotnet run`: its
+build output would go to stdout, which is the MCP channel.)
+
 ```json
 {
   "mcpServers": {
     "ripple": {
       "command": "dotnet",
-      "args": ["run", "--project", "/path/to/Graphhacks/src/Ripple.Mcp"],
+      "args": ["/path/to/Graphhacks/src/Ripple.Mcp/bin/Release/net10.0/Ripple.Mcp.dll"],
       "env": { "FALKORDB": "localhost:6379", "RIPPLE_GRAPH": "eshop" }
     }
   }
