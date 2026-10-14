@@ -8,7 +8,7 @@ namespace Ripple.Core.Queries;
 ///   kind, contract, publisherService, publisher, consumerService, handler, reader, path, expected, actual
 /// $contract (nullable) narrows any of them to one event contract.
 ///
-/// Note the `WITH` after each first WHERE: on FalkorDB 4.x (module 60002) a WHERE on the first MATCH followed by a
+/// Note the `WITH` after each first WHERE: on FalkorDB v6.0.2 (graph module 60002) a WHERE on the first MATCH followed by a
 /// MATCH that starts from two already-bound nodes is planned as a Cartesian product that ignores the bindings.
 /// Projecting with WITH avoids it. Likewise a join written as `a.path = b.path` across two traversals can be planned as a
 /// Value Hash Join that loses a binding, so joins on property values are written as inline pattern properties.

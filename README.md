@@ -102,7 +102,7 @@ One FalkorDB graph per repository and commit.
 | `Type` | `{assembly}\|{fqn}` | `fqn`, `name`, `kind`, `service`, `file` | code |
 | `Method` | `{assembly}\|{fqn(params)}` | `fqn`, `name`, `signature`, `type`, `service`, `file`, `startLine`, `endLine`, `isPublic` | code |
 | `EventContract` | event class name (= RabbitMQ routing key) | `name` | contract |
-| `EventShape` | `{assembly}\|{event fqn}` — one service's copy | `fqn`, `name`, `service`, `file`, `line` | contract |
+| `EventShape` | `{assembly}\|{event fqn}` — one service's copy | `fqn`, `name`, `service`, `file`, `line`, `unboundParams` | contract |
 | `Property` | `{shape key}\|{json path}` | `path`, `name`, `type`, `wireType`, `jsonKind`, `settable`, `depth`, `file`, `line` | contract |
 
 ### Relationships
@@ -132,6 +132,183 @@ These are the exact strings in [`RippleQueries.cs`](src/Ripple.Core/Queries/Ripp
 with `ripple queries`).
 
 <!-- QUERIES:BEGIN -->
+#### `RippleQueries.DanglingReads`
+
+```cypher
+MATCH (pub:Method)-[:PUBLISHES]->(ps:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(cs:EventShape)<-[:HANDLES]-(h:Method)
+WHERE ps <> cs AND ($contract IS NULL OR c.name = $contract)
+WITH pub, ps, c, cs, h
+MATCH (h)-[:CALLS*0..3]->(r:Method)-[rd:READS]->(cp:Property)<-[:HAS_PROPERTY]-(cs)
+WHERE rd.context <> 'log' AND NOT (ps)-[:HAS_PROPERTY]->(:Property {path: cp.path})
+RETURN DISTINCT 'dangling-read' AS kind, c.name AS contract, pub.service AS publisherService, pub.fqn AS publisher,
+       h.service AS consumerService, h.fqn AS handler, r.fqn AS reader, cp.path AS path, cp.wireType AS expected, null AS actual,
+       pub.file AS publisherFile, pub.startLine AS publisherLine, r.file AS readerFile, rd.line AS readerLine
+ORDER BY contract, consumerService, path
+```
+
+#### `RippleQueries.DanglingForwards`
+
+```cypher
+MATCH (pub:Method)-[:PUBLISHES]->(ps:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(cs:EventShape)<-[:HANDLES]-(h:Method)
+WHERE ps <> cs AND ($contract IS NULL OR c.name = $contract)
+WITH pub, ps, c, cs, h
+MATCH (h)-[:CALLS*0..3]->(r:Method)-[fw:FORWARDS]->(cs)-[:HAS_PROPERTY]->(cp:Property)
+WHERE NOT (ps)-[:HAS_PROPERTY]->(:Property {path: cp.path})
+RETURN DISTINCT 'dangling-forward' AS kind, c.name AS contract, pub.service AS publisherService, pub.fqn AS publisher,
+       h.service AS consumerService, h.fqn AS handler, r.fqn AS reader, cp.path AS path, cp.wireType AS expected, null AS actual,
+       pub.file AS publisherFile, pub.startLine AS publisherLine, r.file AS readerFile, fw.line AS readerLine
+ORDER BY contract, consumerService, path
+```
+
+#### `RippleQueries.TypeDrift`
+
+```cypher
+MATCH (pub:Method)-[:PUBLISHES]->(ps:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(cs:EventShape)<-[:HANDLES]-(h:Method)
+WHERE ps <> cs AND ($contract IS NULL OR c.name = $contract)
+WITH pub, ps, c, cs, h
+MATCH (cs)-[:HAS_PROPERTY]->(cp:Property)
+WITH pub, ps, c, cs, h, cp
+MATCH (ps)-[:HAS_PROPERTY]->(pp:Property {path: cp.path})
+WHERE pp.wireType <> cp.wireType
+  AND NOT replace(pp.wireType, '?', '') + '>' + replace(cp.wireType, '?', '') IN $compatible
+  AND NOT (replace(pp.wireType, '?', '') = replace(cp.wireType, '?', '') AND cp.wireType ENDS WITH '?')
+RETURN DISTINCT 'type-drift' AS kind, c.name AS contract, pub.service AS publisherService, pub.fqn AS publisher,
+       h.service AS consumerService, h.fqn AS handler, null AS reader, cp.path AS path, cp.wireType AS expected, pp.wireType AS actual,
+       pub.file AS publisherFile, pub.startLine AS publisherLine, cp.file AS readerFile, cp.line AS readerLine
+ORDER BY contract, consumerService, path
+```
+
+#### `RippleQueries.UnfillableReads`
+
+```cypher
+MATCH (pub:Method)-[:PUBLISHES]->(ps:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(cs:EventShape)<-[:HANDLES]-(h:Method)
+WHERE ps <> cs AND ($contract IS NULL OR c.name = $contract)
+WITH pub, ps, c, cs, h
+MATCH (h)-[:CALLS*0..3]->(r:Method)-[rd:READS]->(cp:Property {settable: false})<-[:HAS_PROPERTY]-(cs)
+WHERE rd.context <> 'log'
+RETURN DISTINCT 'unfillable-read' AS kind, c.name AS contract, pub.service AS publisherService, pub.fqn AS publisher,
+       h.service AS consumerService, h.fqn AS handler, r.fqn AS reader, cp.path AS path, cp.wireType AS expected, null AS actual,
+       pub.file AS publisherFile, pub.startLine AS publisherLine, r.file AS readerFile, rd.line AS readerLine
+ORDER BY contract, consumerService, path
+```
+
+#### `RippleQueries.UnbindableConstructor`
+
+```cypher
+MATCH (c:EventContract)<-[:SHAPE_OF]-(cs:EventShape)<-[:HANDLES]-(h:Method)
+WHERE size(cs.unboundParams) > 0 AND ($contract IS NULL OR c.name = $contract)
+UNWIND cs.unboundParams AS param
+RETURN DISTINCT 'unbindable-constructor' AS kind, c.name AS contract, null AS publisherService, null AS publisher,
+       h.service AS consumerService, h.fqn AS handler, null AS reader, param AS path, null AS expected, null AS actual,
+       null AS publisherFile, null AS publisherLine, cs.file AS readerFile, cs.line AS readerLine
+ORDER BY contract, consumerService, path
+```
+
+#### `RippleQueries.StarvedSubscriptions`
+
+```cypher
+MATCH (s:Service)-[sub:SUBSCRIBES]->(c:EventContract)
+WHERE ($contract IS NULL OR c.name = $contract)
+  AND NOT (:Method)-[:PUBLISHES]->(:EventShape)-[:SHAPE_OF]->(c)
+RETURN DISTINCT 'starved-subscription' AS kind, c.name AS contract, null AS publisherService, null AS publisher,
+       s.name AS consumerService, sub.handler AS handler, null AS reader, null AS path, null AS expected, null AS actual
+ORDER BY contract, consumerService
+```
+
+#### `RippleQueries.CrossServiceReach`
+
+```cypher
+MATCH (m:Method {key: $key})
+MATCH path = (m)-[:CALLS*0..6]->(pub:Method)-[:PUBLISHES]->(ps:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(cs:EventShape)<-[:HANDLES]-(h:Method)
+WHERE h.service <> m.service
+RETURN c.name AS contract, pub.fqn AS publisher, h.service AS consumerService, h.fqn AS handler, min(length(path)) AS hops
+ORDER BY hops, consumerService
+LIMIT 50
+```
+
+#### `RippleQueries.Callers`
+
+```cypher
+MATCH path = (caller:Method)-[:CALLS*1..5]->(m:Method {key: $key})
+RETURN caller.service AS service, caller.fqn AS caller, min(length(path)) AS hops
+ORDER BY hops, caller
+LIMIT 50
+```
+
+#### `RippleQueries.MaterializeDependsOn`
+
+```cypher
+MATCH (pub:Method)-[:PUBLISHES]->(:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(:EventShape)<-[:HANDLES]-(h:Method)
+WHERE pub.service <> h.service
+WITH h.service AS consumer, pub.service AS publisher, collect(DISTINCT c.name) AS contracts
+MATCH (a:Service {key: consumer})
+WITH a, publisher, contracts
+MATCH (b:Service {key: publisher})
+MERGE (a)-[d:DEPENDS_ON]->(b)
+SET d.contracts = contracts, d.weight = size(contracts)
+```
+
+#### `RippleQueries.BridgeScores`
+
+```cypher
+CALL algo.betweenness({nodeLabels: ['Service'], relationshipTypes: ['DEPENDS_ON']}) YIELD node, score
+SET node.bridgeScore = score
+```
+
+#### `RippleQueries.DependencyRank`
+
+```cypher
+CALL algo.pageRank('Service', 'DEPENDS_ON') YIELD node, score
+SET node.dependencyRank = score
+```
+
+#### `RippleQueries.ServiceRisk`
+
+```cypher
+MATCH (s:Service {kind: 'service'})
+OPTIONAL MATCH (s)-[out:DEPENDS_ON]->(up:Service)
+WITH s, collect(DISTINCT {service: up.name, contracts: out.contracts}) AS consumes
+OPTIONAL MATCH (down:Service)-[inc:DEPENDS_ON]->(s)
+RETURN s.name AS service, s.bridgeScore AS bridgeScore, s.dependencyRank AS dependencyRank,
+       collect(DISTINCT {service: down.name, contracts: inc.contracts}) AS consumedBy, consumes
+ORDER BY bridgeScore DESC, dependencyRank DESC
+```
+
+#### `ToolQueries.Contracts`
+
+```cypher
+MATCH (c:EventContract)
+OPTIONAL MATCH (pub:Method)-[:PUBLISHES]->(:EventShape)-[:SHAPE_OF]->(c)
+OPTIONAL MATCH (h:Method)-[:HANDLES]->(:EventShape)-[:SHAPE_OF]->(c)
+RETURN c.name AS contract, collect(DISTINCT pub.service) AS publishers, collect(DISTINCT h.service) AS consumers
+ORDER BY contract
+```
+
+#### `ToolQueries.FieldConsumers`
+
+```cypher
+MATCH (c:EventContract {name: $contract})<-[:SHAPE_OF]-(cs:EventShape)<-[:HANDLES]-(h:Method)
+WITH cs, h
+MATCH (cs)-[:HAS_PROPERTY]->(cp:Property {path: $path})
+OPTIONAL MATCH (h)-[:CALLS*0..3]->(r:Method)-[rd:READS]->(cp)
+OPTIONAL MATCH (h)-[:CALLS*0..3]->(f:Method)-[fw:FORWARDS]->(cs)
+WITH h, cs, cp, collect(DISTINCT CASE WHEN rd.context = 'code' THEN {method: r.fqn, file: r.file, line: rd.line} END) AS reads,
+     collect(DISTINCT CASE WHEN f IS NOT NULL THEN {method: f.fqn, file: f.file, line: fw.line, to: fw.to} END) AS forwards
+WHERE size(reads) > 0 OR size(forwards) > 0
+RETURN h.service AS service, h.fqn AS handler, cp.wireType AS wireType, reads, forwards
+ORDER BY service
+```
+
+#### `ToolQueries.FindMethods`
+
+```cypher
+MATCH (m:Method) WHERE m.fqn CONTAINS $text
+RETURN m.key AS key, m.service AS service, m.file AS file, m.startLine AS line
+ORDER BY service, key
+LIMIT 25
+```
+
+`RippleQueries.Compatible` (publisher→consumer wire types that always deserialise): `int32>int64`, `int32>decimal`, `int32>double`, `int64>decimal`, `int64>double`, `decimal>double`, `double>decimal`, `guid>string`, `datetime>string`, `enum:string>string`, `enum:number>int32`, `enum:number>int64`
 <!-- QUERIES:END -->
 
 ---
@@ -139,6 +316,68 @@ with `ripple queries`).
 ## Evaluation
 
 <!-- EVAL:BEGIN -->
+**221 mutations of the real eShop code, every one of which compiles.** Ripple finds every consumer service each one breaks
+at run time, with no false alarms; the compiler finds none of them by construction.
+
+| Approach | Precision | Recall | TP | FP | FN | Exact |
+|---|---|---|---|---|---|---|
+| Compiler | n/a | 0 % | 0 | 0 | 166 | 80/221 |
+| grep | 47 % | 94 % | 156 | 173 | 10 | 75/221 |
+| Topology | 43 % | 72 % | 120 | 160 | 46 | 67/221 |
+| Schema diff (no READS) | 78 % | 100 % | 166 | 48 | 0 | 175/221 |
+| Ripple, handler body only | 100 % | 100 % | 166 | 0 | 0 | 221/221 |
+| Ripple | 100 % | 100 % | 166 | 0 | 0 | 221/221 |
+
+Scored per (mutation, consumer service): 166 broken consumer services across 141 breaking mutations, plus 80 mutations
+that break nothing. *Exact* counts mutations where the approach flagged precisely the broken services (including none).
+
+| Class | Mutation | n | breaking | Ripple | Schema diff | Topology | grep |
+|---|---|---|---|---|---|---|---|
+| `rename` | publisher renames an event property | 40 | 25 | 28/28 · 0 FP | 28/28 · 22 FP | 28/28 · 39 FP | 26/28 · 22 FP |
+| `rename-keep` | same rename + `[JsonPropertyName(old)]` (control: wire unchanged) | 40 | 0 | 0/0 · 0 FP | 0/0 · 0 FP | 0/0 · 67 FP | 0/0 · 48 FP |
+| `json-ignore` | publisher adds `[JsonIgnore]` | 40 | 25 | 28/28 · 0 FP | 28/28 · 22 FP | 28/28 · 39 FP | 26/28 · 22 FP |
+| `nullable` | publisher makes a value-type property nullable | 23 | 17 | 24/24 · 0 FP | 24/24 · 0 FP | 24/24 · 13 FP | 22/24 · 7 FP |
+| `widen` | publisher changes `int` to `long` | 15 | 15 | 22/22 · 0 FP | 22/22 · 0 FP | 22/22 · 2 FP | 20/22 · 0 FP |
+| `consumer-rename` | a consumer renames its own copy's property | 50 | 46 | 46/46 · 0 FP | 46/46 · 4 FP | 0/46 · 0 FP | 44/46 · 74 FP |
+| `event-rename` | publisher renames the event class (routing key) | 13 | 13 | 18/18 · 0 FP | 18/18 · 0 FP | 18/18 · 0 FP | 18/18 · 0 FP |
+
+(cells: broken services found / total, then false positives)
+
+### Method
+
+- **Mutations** are applied with Roslyn to the eShop solution (`Renamer` for renames, syntax edits for attributes and
+  types) and kept only if every affected project still compiles — so every one is a green build. Each publisher-side
+  property of every published integration event gets the publisher classes; every property of every consumer copy gets
+  `consumer-rename`; every published event gets `event-rename`.
+- **Ground truth does not use the graph.** [`WireOracle`](src/Ripple.Core/Eval/WireOracle.cs) compiles the mutated
+  solution in memory (`Compilation.Emit`), loads the publisher's event type and each consumer's own copy into a
+  collectible `AssemblyLoadContext`, fills a publisher instance with adversarial values (`null` for nullables, values
+  above `int.MaxValue` for `long`, …), serialises it with eShop's event-bus `JsonSerializerOptions`, deserialises it
+  into each consumer copy and diffs the JSON paths. A consumer is broken if deserialisation throws, if the message is
+  no longer routed to it (event renamed), or if a JSON path it *uses* comes back different.
+- **"Uses"** comes from a separate usage oracle (Roslyn `SymbolFinder` over the consumer's copy, plus whole-event
+  forwarding). This half is a second implementation rather than an independent measurement, so its labels are exported
+  for review in [`eval/usage-labels.tsv`](eval/usage-labels.tsv) (36 service/contract/field triples).
+- **Baselines.** *grep*: a consumer file mentions both the event name and the changed member. *Topology*: every
+  service subscribed to the changed contract (what a service map knows). *Schema diff*: Ripple's graph without `READS`
+  — every consumer whose copy declares a field the publisher no longer sends or types differently (what a schema
+  registry compatibility check knows). *Handler body only*: Ripple with `CALLS*0..0` instead of `*0..3`.
+
+### What the numbers do and don't show
+
+- The gap between *Schema diff* (48 false positives) and Ripple (0) is the value of modelling which fields each
+  consumer actually reads: a schema registry would flag every unused field of every subscriber.
+- *Handler body only* scores the same as full Ripple: eShop's handlers read event fields inline, so this benchmark does
+  not exercise read propagation through `CALLS`.
+- The classes above are the ones eShop's code can express. Ripple is known to miss enum-member renames inside
+  string-serialised enums, global naming policies or converters registered at run time, `[JsonIgnore(Condition = …)]`,
+  reads behind reflection or positional deconstruction, and reads more than 3 calls from the handler (see Limitations).
+  None of these occur in eShop, so they are not in the numbers.
+- Building the benchmark found real bugs in Ripple (and three FalkorDB planner issues, below); an earlier run scored 64%
+  precision and 89% recall before they were fixed. Raw per-mutation results, including the wire notes for every
+  mutation, are in [`eval/results.md`](eval/results.md) and [`eval/results.json`](eval/results.json).
+
+Reproduce: `dotnet run --project src/Ripple.Cli -- eval --repo ../eshop --out eval` (about 25 minutes).
 <!-- EVAL:END -->
 
 ---
@@ -148,7 +387,7 @@ with `ripple queries`).
 Requirements: Docker, .NET 10 SDK.
 
 ```bash
-docker compose up -d                       # FalkorDB on :6379, FalkorDB Browser on http://localhost:3000
+docker compose up -d                       # FalkorDB on :6379 + Browser on http://localhost:3000, eShop graphs preloaded
 git clone https://github.com/dotnet/eShop ../eshop
 # eShop pins SDK 10.0.302; on another 10.0.x feature band, relax it:
 sed -i 's/"version": "10.0.302"/"version": "10.0.100"/' ../eshop/global.json
@@ -195,10 +434,11 @@ RETURN p
 
 ## FalkorDB notes
 
-While building Ripple we hit two query-planner issues in FalkorDB (module 60002); see
+While building Ripple we hit three query-planner issues in FalkorDB (module 60002); see
 [`docs/falkordb-cartesian-repro.md`](docs/falkordb-cartesian-repro.md). The first one silently turned a type-drift
-check into a cross product of unrelated contracts. Every Ripple query now projects with `WITH` after its first filter,
-and `ripple selfcheck` runs `GRAPH.EXPLAIN` on all of them and fails if any plan contains a Cartesian Product.
+check into a cross product of unrelated contracts. Every Ripple query now projects with `WITH` after its first filter
+and joins on inline pattern properties, and `ripple selfcheck` runs `GRAPH.EXPLAIN` on all of them and fails if any
+plan contains a Cartesian Product or a Value Hash Join.
 
 ---
 

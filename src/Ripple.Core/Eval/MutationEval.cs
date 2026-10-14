@@ -229,7 +229,7 @@ public sealed class MutationEval(LoadedSolution loaded, GraphStore store, Action
                 {
                     var r = wire[project.AssemblyName];
                     var used = await UsedPathsAsync(mutated, project, copy);
-                    foreach (var path in used) labels.Add($"{project.AssemblyName}\t{contract}\t{path}");
+                    if (!m.ConsumerSide) foreach (var path in used) labels.Add($"{project.AssemblyName}\t{contract}\t{path}");
                     if (r.Throws) { truth.Add(project.AssemblyName); wireNotes.Add($"{project.AssemblyName} {contract}: throws ({r.Error})"); continue; }
                     var hit = r.LostPaths.Where(used.Contains).ToList();
                     if (hit.Count > 0) { truth.Add(project.AssemblyName); wireNotes.Add($"{project.AssemblyName} {contract}: lost {string.Join(",", hit)}"); }

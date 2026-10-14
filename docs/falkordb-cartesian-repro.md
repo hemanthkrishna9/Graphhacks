@@ -1,6 +1,6 @@
 # FalkorDB: bound variables dropped after a filtered MATCH
 
-Found while building Ripple (FalkorDB module version 60002, Redis 8.10.2, `falkordb/falkordb:latest` on 2026-10-15).
+Found while building Ripple (FalkorDB graph module 60002 = v6.0.2, Redis 8.10.2, image `falkordb/falkordb@sha256:107455e8…`, 2026-10-15).
 
 A `WHERE` on the first `MATCH`, followed by a `MATCH` that starts from **two** already-bound nodes, is planned as a
 Cartesian product that re-scans both nodes by label, so the bindings are ignored.
@@ -51,3 +51,29 @@ RETURN consumer, publisher
 
 Inserting `WITH a, publisher, contracts` between the two MATCHes returns the 9 rows. Ripple uses that form when it
 materialises `(:Service)-[:DEPENDS_ON]->(:Service)`.
+
+## Third observation: a value join loses one side's binding
+
+Ripple's type-drift check pairs each publisher field with the consumer field at the same JSON path. Written as a join
+on property values, FalkorDB plans it as a **Value Hash Join** whose `(ps)->(pp)` branch is no longer restricted to the
+bound `ps` (checked by returning `ps.key = pp.shape`: most rows were `false`):
+
+```
+MATCH (pub:Method)-[:PUBLISHES]->(ps:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(cs:EventShape)<-[:HANDLES]-(h:Method)
+WHERE ps <> cs
+WITH pub, ps, c, cs, h
+MATCH (ps)-[:HAS_PROPERTY]->(pp:Property)
+MATCH (cs)-[:HAS_PROPERTY]->(cp:Property)
+WHERE pp.path = cp.path                       -- planned as: Value Hash Join (ps)->(pp) / (cs)->(cp)
+RETURN ps.key = pp.shape AS bound, count(*)   -- 'false' for most rows
+```
+
+Matching the publisher field with an inline pattern property instead binds correctly:
+
+```
+MATCH (cs)-[:HAS_PROPERTY]->(cp:Property)
+WITH pub, ps, c, cs, h, cp
+MATCH (ps)-[:HAS_PROPERTY]->(pp:Property {path: cp.path})
+```
+
+`ripple selfcheck` fails on any plan that contains `Cartesian Product` or `Value Hash Join`.
