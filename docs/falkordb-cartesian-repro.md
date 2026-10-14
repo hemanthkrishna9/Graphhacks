@@ -35,3 +35,19 @@ Correct results (2 rows) when any of these hold:
 
 Ripple's `selfcheck` command runs `GRAPH.EXPLAIN` on every product query and fails if any plan contains a
 Cartesian Product.
+
+## Second observation: consecutive MATCHes on projected values return nothing
+
+On the Ripple graph for eShop (not yet reduced to a minimal repro: the same shape works on a toy graph), this returns
+**0 rows**, while each half returns the expected 9 pairs:
+
+```
+MATCH (pub:Method)-[:PUBLISHES]->(:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(:EventShape)<-[:HANDLES]-(h:Method)
+WHERE pub.service <> h.service
+WITH h.service AS consumer, pub.service AS publisher, collect(DISTINCT c.name) AS contracts
+MATCH (a:Service {key: consumer}) MATCH (b:Service {key: publisher})
+RETURN consumer, publisher
+```
+
+Inserting `WITH a, publisher, contracts` between the two MATCHes returns the 9 rows. Ripple uses that form when it
+materialises `(:Service)-[:DEPENDS_ON]->(:Service)`.

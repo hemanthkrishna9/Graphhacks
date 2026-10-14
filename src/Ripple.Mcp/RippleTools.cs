@@ -63,6 +63,11 @@ public static class RippleTools
         }, Json);
     }
 
+    [McpServerTool(Name = "service_risk", ReadOnly = true),
+     Description("Rank services by how much of the event-driven system runs through them: betweenness centrality (bridgeScore) and PageRank (dependencyRank) over the service dependency graph derived from integration events, with who consumes what from whom.")]
+    public static string ServiceRisk(GraphStore store) =>
+        JsonSerializer.Serialize(store.Query(RippleQueries.ServiceRisk), Json);
+
     [McpServerTool(Name = "run_cypher", ReadOnly = true),
      Description("Run a read-only Cypher query against the Ripple graph (FalkorDB GRAPH.RO_QUERY; writes are rejected by the server). Returns at most 200 rows. Use graph_schema first.")]
     public static string RunCypher(GraphStore store, [Description("Read-only openCypher query")] string cypher)

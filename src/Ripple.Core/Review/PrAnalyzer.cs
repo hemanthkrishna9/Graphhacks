@@ -64,6 +64,9 @@ public sealed class PrAnalyzer(RippleConfig config, GraphStore store, Action<str
     public static readonly string ExtractorVersion =
         typeof(PrAnalyzer).Assembly.ManifestModule.ModuleVersionId.ToString("N")[..8];
 
+    /// <summary>Unified diff of the change under review (input to narration).</summary>
+    public static string Diff(string repo, string baseSha, string headSha) => Git(Path.GetFullPath(repo), "diff", $"{baseSha}..{headSha}");
+
     static string Git(string repo, params string[] args) => Run("git", repo, args);
 
     static string Run(string exe, string cwd, params string[] args)

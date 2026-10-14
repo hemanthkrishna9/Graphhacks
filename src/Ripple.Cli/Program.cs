@@ -4,7 +4,7 @@ using Ripple.Core.Review;
 
 // ripple ingest  --repo <path> [--graph name]
 // ripple check   [--graph name] [--contract EventName]
-// ripple analyze --repo <path> --base <ref> --head <ref> [--reindex]
+// ripple analyze --repo <path> --base <ref> --head <ref> [--reindex] [--markdown comment.md] [--repo-url https://github.com/o/r/blob/<sha>]
 var (command, options) = Args.Parse(args);
 var falkor = options.GetValueOrDefault("falkor") ?? Environment.GetEnvironmentVariable("FALKORDB") ?? "localhost:6379";
 void Log(string m) => Console.Error.WriteLine(m);
@@ -33,14 +33,48 @@ switch (command)
     case "analyze":
     {
         var config = LoadConfig(options);
+        var repo = Require(options, "repo");
         var analyzer = new PrAnalyzer(config, new GraphStore(falkor, config.Graph), Log);
-        var result = await analyzer.AnalyzeAsync(Require(options, "repo"), Require(options, "base"), Require(options, "head"),
+        var result = await analyzer.AnalyzeAsync(repo, Require(options, "base"), Require(options, "head"),
             reindex: options.ContainsKey("reindex"));
-        Console.WriteLine($"base {result.BaseSha[..10]} ({result.BaselineFindings} pre-existing findings) -> head {result.HeadSha[..10]}");
-        Console.WriteLine($"changed files: {string.Join(", ", result.ChangedFiles)}");
-        Console.WriteLine($"introduced: {result.Introduced.Count}, resolved: {result.Resolved.Count}");
-        Report.PrintFindings(result.Introduced);
+        Console.Error.WriteLine($"base {result.BaseSha[..10]} ({result.BaselineFindings} pre-existing findings) -> head {result.HeadSha[..10]}; " +
+                                $"introduced {result.Introduced.Count}, resolved {result.Resolved.Count}");
+
+        // --markdown <file>: the PR comment (graph findings + optional narration). Otherwise print the plain list.
+        if (options.GetValueOrDefault("markdown") is { } markdownPath)
+        {
+            var narration = await Narrator.NarrateAsync(result.Introduced, PrAnalyzer.Diff(repo, result.BaseSha, result.HeadSha), Log);
+            var markdown = PrReport.Render(result, narration, options.GetValueOrDefault("repo-url"));
+            File.WriteAllText(markdownPath, markdown);
+            Console.Error.WriteLine($"wrote {markdownPath}");
+        }
+        else Report.PrintFindings(result.Introduced);
         return result.Introduced.Count == 0 ? 0 : 1;
+    }
+    case "queries":
+    {
+        // Writes every product query, verbatim, into README.md between the QUERIES markers.
+        var readme = options.GetValueOrDefault("readme") ?? "README.md";
+        var md = new System.Text.StringBuilder();
+        foreach (var field in typeof(Ripple.Core.Queries.RippleQueries).GetFields().Concat(typeof(Ripple.Core.Queries.ToolQueries).GetFields())
+                     .Where(f => f.IsLiteral && f.FieldType == typeof(string) && f.Name != "SchemaNotes"))
+        {
+            md.AppendLine($"#### `{field.DeclaringType!.Name}.{field.Name}`");
+            md.AppendLine();
+            md.AppendLine("```cypher");
+            md.AppendLine(((string)field.GetRawConstantValue()!).Trim());
+            md.AppendLine("```");
+            md.AppendLine();
+        }
+        md.AppendLine("`RippleQueries.Compatible` (publisher→consumer wire types that always deserialise): " +
+                      string.Join(", ", Ripple.Core.Queries.RippleQueries.Compatible.Select(c => $"`{c}`")));
+        var text = File.ReadAllText(readme);
+        const string begin = "<!-- QUERIES:BEGIN -->", end = "<!-- QUERIES:END -->";
+        var start = text.IndexOf(begin, StringComparison.Ordinal) + begin.Length;
+        text = text[..start] + "\n" + md + text[text.IndexOf(end, StringComparison.Ordinal)..];
+        File.WriteAllText(readme, text);
+        Console.Error.WriteLine($"updated {readme}");
+        return 0;
     }
     case "selfcheck":
     {
@@ -56,7 +90,7 @@ switch (command)
         foreach (var (name, cypher) in Ripple.Core.Queries.RippleQueries.All())
         {
             var plan = store.Explain(cypher, parameters);
-            var bad = plan.Any(op => op.Contains("Cartesian Product"));
+            var bad = plan.Any(op => op.Contains("Cartesian Product") || op.Contains("Value Hash Join"));
             failed += bad ? 1 : 0;
             Console.WriteLine($"{(bad ? "FAIL" : "ok  ")} {name}");
         }
@@ -85,8 +119,8 @@ switch (command)
             usage:
               ripple ingest  --repo <path> [--graph <name>] [--config ripple.eshop.json]
               ripple check   [--graph <name>] [--contract <EventName>]
-              ripple analyze --repo <path> --base <ref> --head <ref> [--reindex]
-              ripple selfcheck [--graph <name>]   (EXPLAIN every query; fail on Cartesian plans)
+              ripple analyze --repo <path> --base <ref> --head <ref> [--reindex] [--markdown comment.md] [--repo-url https://github.com/o/r/blob/<sha>]
+              ripple selfcheck [--graph <name>]   (EXPLAIN every query; fail on Cartesian / value-hash-join plans)
               ripple eval    --repo <path> [--limit N per kind] [--kinds rename,widen,...] [--out eval]
             options: --falkor host:port (or FALKORDB env var; default localhost:6379)
             """);

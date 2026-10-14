@@ -43,12 +43,13 @@ public sealed class GraphStore
     /// <summary>
     /// Writes the batch into a staging graph, then renames it over this graph, so readers never see a half-written graph.
     /// </summary>
-    public void Replace(GraphBatch batch)
+    public void Replace(GraphBatch batch, Action<GraphStore>? derive = null)
     {
         var staging = WithGraph(Name + ".staging");
         staging.Drop();
         staging.EnsureIndexes();
         staging.Write(batch);
+        derive?.Invoke(staging);
         _redis.KeyRename(staging.Name, Name);
     }
 

@@ -13,7 +13,11 @@ public sealed record Finding(
     string? Reader,
     string? Path,
     string? Expected,
-    string? Actual)
+    string? Actual,
+    string? PublisherFile = null,
+    int? PublisherLine = null,
+    string? ReaderFile = null,
+    int? ReaderLine = null)
 {
     /// <summary>
     /// Stable identity used to diff base vs head findings: what breaks, where, and how — not which handler class
@@ -25,7 +29,11 @@ public sealed record Finding(
         Str(row, "kind")!, severity, check, Str(row, "contract")!,
         Str(row, "publisherService"), Str(row, "publisher"),
         Str(row, "consumerService")!, Str(row, "handler"), Str(row, "reader"),
-        Str(row, "path"), Str(row, "expected"), Str(row, "actual"));
+        Str(row, "path"), Str(row, "expected"), Str(row, "actual"),
+        Str(row, "publisherFile"), Int(row, "publisherLine"), Str(row, "readerFile"), Int(row, "readerLine"));
+
+    static int? Int(IReadOnlyDictionary<string, object?> row, string key) =>
+        row.TryGetValue(key, out var v) && v is not null ? Convert.ToInt32(v) : null;
 
     static string? Str(IReadOnlyDictionary<string, object?> row, string key) =>
         row.TryGetValue(key, out var v) && v is not null ? v.ToString() : null;

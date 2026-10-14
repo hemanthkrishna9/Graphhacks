@@ -315,12 +315,15 @@ public sealed class CodeGraphExtractor
         _batch.Edge("SHAPE_OF", "EventShape", shapeKey, "EventContract", type.Name);
         _batch.Edge("DECLARES", "File", file, "EventShape", shapeKey);
         _batch.Edge("DEFINES_SHAPE", "Type", shapeKey, "EventShape", shapeKey);
-        FlattenShape(shapeKey, type, prefix: "", depth: 0, new HashSet<ITypeSymbol>(SymbolEqualityComparer.Default));
+        var unbound = new List<string>();
+        FlattenShape(shapeKey, type, prefix: "", depth: 0, new HashSet<ITypeSymbol>(SymbolEqualityComparer.Default), unbound);
+        _batch.Node("EventShape", shapeKey, ("unboundParams", unbound.ToArray()));
     }
 
-    void FlattenShape(string shapeKey, ITypeSymbol type, string prefix, int depth, HashSet<ITypeSymbol> visiting)
+    void FlattenShape(string shapeKey, ITypeSymbol type, string prefix, int depth, HashSet<ITypeSymbol> visiting, List<string> unbound)
     {
         if (!visiting.Add(type)) return;
+        foreach (var param in UnboundConstructorParameters(type)) unbound.Add(prefix + "(ctor " + param + ")");
         foreach (var prop in SerializedProperties(type))
         {
             var path = prefix + WireName(prop);
@@ -340,7 +343,7 @@ public sealed class CodeGraphExtractor
             list.Add((shapeKey, path));
 
             if (depth < MaxShapeDepth && IsComposite(valueType))
-                FlattenShape(shapeKey, valueType, path + (element is null ? "." : "[]."), depth + 1, visiting);
+                FlattenShape(shapeKey, valueType, path + (element is null ? "." : "[]."), depth + 1, visiting, unbound);
         }
         visiting.Remove(type);
     }
@@ -387,6 +390,24 @@ public sealed class CodeGraphExtractor
                      ?? ctors.Where(c => c.DeclaredAccessibility == Accessibility.Public).OrderByDescending(c => c.Parameters.Length).FirstOrDefault();
         return chosen?.Parameters.Any(x => string.Equals(x.Name, p.Name, StringComparison.OrdinalIgnoreCase)) == true;
     }
+
+    /// <summary>
+    /// The constructor System.Text.Json deserialises through ([JsonConstructor], else the public parameterless one, else
+    /// a single public parameterised one), and its parameters that match no property by name (case-insensitive).
+    /// </summary>
+    static IEnumerable<string> UnboundConstructorParameters(ITypeSymbol type)
+    {
+        if (type is not INamedTypeSymbol named) return [];
+        var ctors = named.InstanceConstructors.Where(c => c.DeclaredAccessibility == Accessibility.Public && !IsCopyConstructor(c, named)).ToList();
+        var chosen = named.InstanceConstructors.FirstOrDefault(c => HasAttribute(c, "JsonConstructorAttribute"))
+                     ?? (ctors.Any(c => c.Parameters.Length == 0) ? null : ctors.Count == 1 ? ctors[0] : null);
+        if (chosen is null) return [];
+        var names = SerializedProperties(type).Select(p => p.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return chosen.Parameters.Where(p => !names.Contains(p.Name)).Select(p => p.Name).ToList();
+    }
+
+    static bool IsCopyConstructor(IMethodSymbol c, INamedTypeSymbol type) =>
+        c.Parameters.Length == 1 && SymbolEqualityComparer.Default.Equals(c.Parameters[0].Type, type);
 
     static bool HasAttribute(ISymbol s, string name) => s.GetAttributes().Any(a => a.AttributeClass?.Name == name);
 

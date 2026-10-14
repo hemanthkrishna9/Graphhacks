@@ -10,7 +10,9 @@ namespace Ripple.Core.Queries;
 ///
 /// Note the `WITH` after each first WHERE: on FalkorDB 4.x (module 60002) a WHERE on the first MATCH followed by a
 /// MATCH that starts from two already-bound nodes is planned as a Cartesian product that ignores the bindings.
-/// Projecting with WITH avoids it; QueryPlanTests asserts no plan here contains a Cartesian Product.
+/// Projecting with WITH avoids it. Likewise a join written as `a.path = b.path` across two traversals can be planned as a
+/// Value Hash Join that loses a binding, so joins on property values are written as inline pattern properties.
+/// `ripple selfcheck` EXPLAINs every query and fails on either operator.
 /// </summary>
 public static class RippleQueries
 {
@@ -25,7 +27,8 @@ public static class RippleQueries
         MATCH (h)-[:CALLS*0..3]->(r:Method)-[rd:READS]->(cp:Property)<-[:HAS_PROPERTY]-(cs)
         WHERE rd.context <> 'log' AND NOT (ps)-[:HAS_PROPERTY]->(:Property {path: cp.path})
         RETURN DISTINCT 'dangling-read' AS kind, c.name AS contract, pub.service AS publisherService, pub.fqn AS publisher,
-               h.service AS consumerService, h.fqn AS handler, r.fqn AS reader, cp.path AS path, cp.wireType AS expected, null AS actual
+               h.service AS consumerService, h.fqn AS handler, r.fqn AS reader, cp.path AS path, cp.wireType AS expected, null AS actual,
+               pub.file AS publisherFile, pub.startLine AS publisherLine, r.file AS readerFile, rd.line AS readerLine
         ORDER BY contract, consumerService, path
         """;
 
@@ -38,10 +41,11 @@ public static class RippleQueries
         MATCH (pub:Method)-[:PUBLISHES]->(ps:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(cs:EventShape)<-[:HANDLES]-(h:Method)
         WHERE ps <> cs AND ($contract IS NULL OR c.name = $contract)
         WITH pub, ps, c, cs, h
-        MATCH (h)-[:CALLS*0..3]->(r:Method)-[:FORWARDS]->(cs)-[:HAS_PROPERTY]->(cp:Property)
+        MATCH (h)-[:CALLS*0..3]->(r:Method)-[fw:FORWARDS]->(cs)-[:HAS_PROPERTY]->(cp:Property)
         WHERE NOT (ps)-[:HAS_PROPERTY]->(:Property {path: cp.path})
         RETURN DISTINCT 'dangling-forward' AS kind, c.name AS contract, pub.service AS publisherService, pub.fqn AS publisher,
-               h.service AS consumerService, h.fqn AS handler, r.fqn AS reader, cp.path AS path, cp.wireType AS expected, null AS actual
+               h.service AS consumerService, h.fqn AS handler, r.fqn AS reader, cp.path AS path, cp.wireType AS expected, null AS actual,
+               pub.file AS publisherFile, pub.startLine AS publisherLine, r.file AS readerFile, fw.line AS readerLine
         ORDER BY contract, consumerService, path
         """;
 
@@ -55,13 +59,15 @@ public static class RippleQueries
         MATCH (pub:Method)-[:PUBLISHES]->(ps:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(cs:EventShape)<-[:HANDLES]-(h:Method)
         WHERE ps <> cs AND ($contract IS NULL OR c.name = $contract)
         WITH pub, ps, c, cs, h
-        MATCH (ps)-[:HAS_PROPERTY]->(pp:Property)
         MATCH (cs)-[:HAS_PROPERTY]->(cp:Property)
-        WHERE pp.path = cp.path AND pp.wireType <> cp.wireType
+        WITH pub, ps, c, cs, h, cp
+        MATCH (ps)-[:HAS_PROPERTY]->(pp:Property {path: cp.path})
+        WHERE pp.wireType <> cp.wireType
           AND NOT replace(pp.wireType, '?', '') + '>' + replace(cp.wireType, '?', '') IN $compatible
           AND NOT (replace(pp.wireType, '?', '') = replace(cp.wireType, '?', '') AND cp.wireType ENDS WITH '?')
         RETURN DISTINCT 'type-drift' AS kind, c.name AS contract, pub.service AS publisherService, pub.fqn AS publisher,
-               h.service AS consumerService, h.fqn AS handler, null AS reader, cp.path AS path, cp.wireType AS expected, pp.wireType AS actual
+               h.service AS consumerService, h.fqn AS handler, null AS reader, cp.path AS path, cp.wireType AS expected, pp.wireType AS actual,
+               pub.file AS publisherFile, pub.startLine AS publisherLine, cp.file AS readerFile, cp.line AS readerLine
         ORDER BY contract, consumerService, path
         """;
 
@@ -83,7 +89,23 @@ public static class RippleQueries
         MATCH (h)-[:CALLS*0..3]->(r:Method)-[rd:READS]->(cp:Property {settable: false})<-[:HAS_PROPERTY]-(cs)
         WHERE rd.context <> 'log'
         RETURN DISTINCT 'unfillable-read' AS kind, c.name AS contract, pub.service AS publisherService, pub.fqn AS publisher,
-               h.service AS consumerService, h.fqn AS handler, r.fqn AS reader, cp.path AS path, cp.wireType AS expected, null AS actual
+               h.service AS consumerService, h.fqn AS handler, r.fqn AS reader, cp.path AS path, cp.wireType AS expected, null AS actual,
+               pub.file AS publisherFile, pub.startLine AS publisherLine, r.file AS readerFile, rd.line AS readerLine
+        ORDER BY contract, consumerService, path
+        """;
+
+    /// <summary>
+    /// Q4b — Unbindable constructor. System.Text.Json deserialises through the consumer copy's constructor, and every
+    /// constructor parameter must match a property by name; if one doesn't (e.g. a property was renamed but its
+    /// constructor parameter wasn't), every message for that contract throws in the consumer.
+    /// </summary>
+    public const string UnbindableConstructor = """
+        MATCH (c:EventContract)<-[:SHAPE_OF]-(cs:EventShape)<-[:HANDLES]-(h:Method)
+        WHERE size(cs.unboundParams) > 0 AND ($contract IS NULL OR c.name = $contract)
+        UNWIND cs.unboundParams AS param
+        RETURN DISTINCT 'unbindable-constructor' AS kind, c.name AS contract, null AS publisherService, null AS publisher,
+               h.service AS consumerService, h.fqn AS handler, null AS reader, param AS path, null AS expected, null AS actual,
+               null AS publisherFile, null AS publisherLine, cs.file AS readerFile, cs.line AS readerLine
         ORDER BY contract, consumerService, path
         """;
 
@@ -106,6 +128,7 @@ public static class RippleQueries
         ("Q2 dangling forwards", DanglingForwards, "high"),
         ("Q3 type drift", TypeDrift, "critical"),
         ("Q4 unfillable reads", UnfillableReads, "medium"),
+        ("Q4b unbindable constructor", UnbindableConstructor, "critical"),
         ("Q5 starved subscriptions", StarvedSubscriptions, "high"),
     ];
 
@@ -130,9 +153,53 @@ public static class RippleQueries
         LIMIT 50
         """;
 
+    /// <summary>
+    /// Projection for graph algorithms: (consumer:Service)-[:DEPENDS_ON {contracts, weight}]->(publisher:Service),
+    /// derived from the contract layer. FalkorDB's algo.* procedures take one label and one relationship type, so the
+    /// multi-hop event paths are folded into this single edge type first. (The WITH between the two MATCHes works
+    /// around a planner issue noted in docs/falkordb-cartesian-repro.md.)
+    /// </summary>
+    public const string MaterializeDependsOn = """
+        MATCH (pub:Method)-[:PUBLISHES]->(:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(:EventShape)<-[:HANDLES]-(h:Method)
+        WHERE pub.service <> h.service
+        WITH h.service AS consumer, pub.service AS publisher, collect(DISTINCT c.name) AS contracts
+        MATCH (a:Service {key: consumer})
+        WITH a, publisher, contracts
+        MATCH (b:Service {key: publisher})
+        MERGE (a)-[d:DEPENDS_ON]->(b)
+        SET d.contracts = contracts, d.weight = size(contracts)
+        """;
+
+    /// <summary>
+    /// Bridge score: betweenness centrality over the service dependency projection. A change to a service that many
+    /// event paths run through reaches further; stored on Service.bridgeScore for the report and the MCP tools.
+    /// </summary>
+    public const string BridgeScores = """
+        CALL algo.betweenness({nodeLabels: ['Service'], relationshipTypes: ['DEPENDS_ON']}) YIELD node, score
+        SET node.bridgeScore = score
+        """;
+
+    /// <summary>PageRank over the same projection: services whose events many others depend on (Service.dependencyRank).</summary>
+    public const string DependencyRank = """
+        CALL algo.pageRank('Service', 'DEPENDS_ON') YIELD node, score
+        SET node.dependencyRank = score
+        """;
+
+    /// <summary>Q8 — Service risk: what each service publishes to and consumes from others, with its algorithm scores.</summary>
+    public const string ServiceRisk = """
+        MATCH (s:Service {kind: 'service'})
+        OPTIONAL MATCH (s)-[out:DEPENDS_ON]->(up:Service)
+        WITH s, collect(DISTINCT {service: up.name, contracts: out.contracts}) AS consumes
+        OPTIONAL MATCH (down:Service)-[inc:DEPENDS_ON]->(s)
+        RETURN s.name AS service, s.bridgeScore AS bridgeScore, s.dependencyRank AS dependencyRank,
+               collect(DISTINCT {service: down.name, contracts: inc.contracts}) AS consumedBy, consumes
+        ORDER BY bridgeScore DESC, dependencyRank DESC
+        """;
+
     /// <summary>Every product query by name (contract checks, impact queries and MCP tool queries).</summary>
     public static IEnumerable<(string Name, string Cypher)> All() =>
         typeof(RippleQueries).GetFields().Concat(typeof(ToolQueries).GetFields())
-            .Where(f => f.IsLiteral && f.FieldType == typeof(string) && ((string)f.GetRawConstantValue()!).Contains("MATCH"))
+            .Where(f => f.IsLiteral && f.FieldType == typeof(string) && ((string)f.GetRawConstantValue()!).Contains("MATCH")
+                        && !((string)f.GetRawConstantValue()!).Contains("MERGE"))
             .Select(f => (f.Name, (string)f.GetRawConstantValue()!));
 }
