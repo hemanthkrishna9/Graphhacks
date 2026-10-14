@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Ripple.Cli/Ripple.Cli.csproj" />
+    <Project Path="src/Ripple.Core/Ripple.Core.csproj" />
+  </Folder>
+</Solution>
