@@ -25,7 +25,7 @@ public static class PrReport
             return sb.ToString();
         }
 
-        sb.AppendLine($"**This change compiles, but breaks {services.Count} other service(s) at run time** " +
+        sb.AppendLine($"**This change compiles, but breaks {services.Count} service(s) at run time** " +
                       $"through {contracts.Count} integration event(s): {string.Join(", ", services.Select(s => $"`{s}`"))}.");
         sb.AppendLine();
         if (narration?.Summary is { Length: > 0 } summary)
@@ -118,6 +118,7 @@ public static class PrReport
     static string Short(string? fqn)
     {
         if (fqn is null) return "?";
+        if (!fqn.Contains('(')) return fqn.Split('.')[^1];   // a type name (e.g. a subscription's handler class)
         var paren = fqn.IndexOf('(');
         var head = paren < 0 ? fqn : fqn[..paren];
         var parts = head.Split('.');

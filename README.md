@@ -2,7 +2,7 @@
 
 **Ripple finds the bugs your compiler can't: cross-service contract breaks in event-driven .NET.**
 
-> *The diff is 3 lines. The blast radius is 3 services.*
+> *The diff is 3 lines. The blast radius is 3 handlers in 2 other services.*
 
 Ripple is a pull-request review agent. It turns a .NET solution into a semantic code graph with Roslyn, stores it in
 [FalkorDB](https://www.falkordb.com/), and traverses outward from a change to everything it can break — including
@@ -34,25 +34,31 @@ ties the two `OrderStockItem` types together at compile time. So this PR to Orde
 +    public int Quantity { get; }
 ```
 
-builds green, passes every unit test, and every diff-only reviewer approves it. In production:
+builds green and passes every unit test, and nothing in the diff mentions Catalog or Webhooks. At run time
+(the consumer's `Units` silently deserialises to 0):
 
-- **Catalog.API** confirms stock for every order (it reads `Units` = 0 and checks `AvailableStock >= 0`) → oversells.
-- **Catalog.API** calls `RemoveStock(0)` when an order is paid → stock never decreases.
+- **Catalog.API** stock validation (`AvailableStock >= Units`) confirms every order → the shop oversells.
+- **Catalog.API** paid handler calls `RemoveStock(0)`, which throws; the event bus logs a warning and acks the message
+  anyway → every paid order is dropped and stock never goes down.
 - **Webhooks.API** forwards the paid event to external subscribers with `Units: 0`.
 
-Ripple's comment on that PR:
+Ripple's comment on that PR (first of three findings, verbatim from `ripple analyze --markdown`):
 
 ```
-### 1. `Catalog.API` — reads a field `OrderStatusChangedToPaidIntegrationEvent` no longer sends
-(Ordering.API) OrderStatusChangedToPaidDomainEventHandler.Handle()
+### 1. `Catalog.API` — reads a field `OrderStatusChangedToAwaitingValidationIntegrationEvent` no longer sends
+
+Graph path:
+(Ordering.API) OrderStatusChangedToAwaitingValidationDomainEventHandler.Handle()
   -[:PUBLISHES]-> (:EventShape Ordering.API)
-  -[:SHAPE_OF]-> (:EventContract {name: 'OrderStatusChangedToPaidIntegrationEvent'})
+  -[:SHAPE_OF]-> (:EventContract {name: 'OrderStatusChangedToAwaitingValidationIntegrationEvent'})
   <-[:SHAPE_OF]- (:EventShape Catalog.API)
-  <-[:HANDLES]- (Catalog.API) OrderStatusChangedToPaidIntegrationEventHandler.Handle()
+  <-[:HANDLES]- (Catalog.API) OrderStatusChangedToAwaitingValidationIntegrationEventHandler.Handle()
   -[:READS]-> (:Property {path: 'OrderStockItems[].Units'})  (missing in publisher's copy)
+severity high · produced by `Q1 dangling reads` · publisher OrderStatusChangedToAwaitingValidationDomainEventHandler.cs:23 · consumer OrderStatusChangedToAwaitingValidationIntegrationEventHandler.cs:20
 ```
 
-Diff-only reviewers can't see this, and neither can a plain call graph: there is no call edge from Ordering to
+The full comment is in [`docs/sample-comment.md`](docs/sample-comment.md). A diff-only review has nothing to point at,
+and neither has a plain call graph: there is no call edge from Ordering to
 Catalog. The coupling only exists in the contract layer, which is what Ripple models.
 
 ---
@@ -84,7 +90,9 @@ flowchart LR
 4. **Explain (optional).** One Claude call (`claude-opus-5-5`, structured JSON output) writes prose around the findings.
    It receives the numbered findings and the diff; explanations for findings the graph did not return are dropped, and
    the report always renders findings and paths from the graph. Without `ANTHROPIC_API_KEY` the text is a template.
-5. **Agents.** An MCP server exposes the same queries as tools, so Claude Desktop / Claude Code / any MCP client can
+5. **Cascades.** Derived `TRIGGERS` edges fold each contract path into one hop, so "what runs because of this method,
+   in every service" is a single variable-length `CALLS|TRIGGERS` traversal (Q9).
+6. **Agents.** An MCP server exposes the same queries as tools, so Claude Desktop / Claude Code / any MCP client can
    ask "what breaks if I change this field?".
 
 ---
@@ -120,9 +128,36 @@ One FalkorDB graph per repository and commit.
 | `(Method)-[:READS {line, context}]->(Property)` | code reads the field (`context: log` inside logging calls) |
 | `(Method)-[:FORWARDS {line, to}]->(EventShape)` | the whole event goes to an `object`/generic parameter |
 | `(Type)-[:DEFINES_SHAPE]->(EventShape)` | the event's type node |
+| `(Method)-[:TRIGGERS {contracts}]->(Method)` | derived: publisher → handler in another service, for cascade traversal |
 | `(Service)-[:DEPENDS_ON {contracts, weight}]->(Service)` | derived projection for graph algorithms |
 
-On eShop: 1,786 nodes and ~3,100 edges, extracted and written in about 20 seconds.
+On eShop: 1,786 nodes and about 2,500 edges, extracted and written in about 20 seconds.
+
+---
+
+## The order saga, recovered from code
+
+Nothing in eShop declares its order workflow in one place: it emerges from handlers, MediatR commands, domain events
+and integration events spread over five services. One Ripple query (Q9, `event_cascade` over MCP) recovers it, starting
+from OrderProcessor's grace-period job:
+
+| hops | service | handler |
+|---|---|---|
+| 1 | Ordering.API | GracePeriodConfirmedIntegrationEventHandler |
+| 2 | Ordering.API | SetAwaitingValidationOrderStatusCommandHandler |
+| 4 | Ordering.API | OrderStatusChangedToAwaitingValidationDomainEventHandler |
+| 5 | Catalog.API, WebApp | OrderStatusChangedToAwaitingValidationIntegrationEventHandler |
+| 6 | Ordering.API | OrderStockConfirmed / OrderStockRejected IntegrationEventHandler |
+| 7 | Ordering.API | SetStockConfirmed / SetStockRejected OrderStatusCommandHandler |
+| 9 | Ordering.API | OrderStatusChangedToStockConfirmedDomainEventHandler |
+| 10 | PaymentProcessor, WebApp | OrderStatusChangedToStockConfirmedIntegrationEventHandler |
+| 11 | Ordering.API | OrderPaymentSucceeded / OrderPaymentFailed IntegrationEventHandler |
+| 12 | Ordering.API | SetPaidOrderStatusCommandHandler, CancelOrderCommandHandler |
+| 14 | Ordering.API | OrderStatusChangedToPaidDomainEventHandler, OrderCancelledDomainEventHandler |
+
+The hop from the first handler to Catalog alone is seven edges: `CALLS:mediatr` → `CALLS` → `CALLS:domain-event` →
+`PUBLISHES` → `SHAPE_OF` → `SHAPE_OF` ← `HANDLES`. This is the traversal a diff, a grep or an in-process call graph
+cannot do, and what the contract checks build on.
 
 ---
 
@@ -248,6 +283,26 @@ MERGE (a)-[d:DEPENDS_ON]->(b)
 SET d.contracts = contracts, d.weight = size(contracts)
 ```
 
+#### `RippleQueries.MaterializeTriggers`
+
+```cypher
+MATCH (pub:Method)-[:PUBLISHES]->(:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(:EventShape)<-[:HANDLES]-(h:Method)
+WHERE pub.service <> h.service
+WITH pub, h, collect(DISTINCT c.name) AS contracts
+MERGE (pub)-[t:TRIGGERS]->(h)
+SET t.contracts = contracts, t.source = 'inferred', t.via = 'event-bus'
+```
+
+#### `RippleQueries.EventCascade`
+
+```cypher
+MATCH (m:Method {key: $key})
+MATCH p = (m)-[:CALLS|TRIGGERS*1..14]->(h:Method)
+WHERE h.name = 'Handle' AND h.service <> m.service
+RETURN h.service AS service, h.type AS handler, min(length(p)) AS hops
+ORDER BY hops, service, handler
+```
+
 #### `RippleQueries.BridgeScores`
 
 ```cypher
@@ -308,7 +363,7 @@ ORDER BY service, key
 LIMIT 25
 ```
 
-`RippleQueries.Compatible` (publisher→consumer wire types that always deserialise): `int32>int64`, `int32>decimal`, `int32>double`, `int64>decimal`, `int64>double`, `decimal>double`, `double>decimal`, `guid>string`, `datetime>string`, `enum:string>string`, `enum:number>int32`, `enum:number>int64`
+`RippleQueries.Compatible` (publisher→consumer wire types that always deserialise): `int32>int64`, `int32>decimal`, `int32>double`, `int64>decimal`, `int64>double`, `decimal>double`, `guid>string`, `datetime>string`, `enum:string>string`, `enum:number>int32`, `enum:number>int64`
 <!-- QUERIES:END -->
 
 ---
@@ -316,8 +371,9 @@ LIMIT 25
 ## Evaluation
 
 <!-- EVAL:BEGIN -->
-**221 mutations of the real eShop code, every one of which compiles.** Ripple finds every consumer service each one breaks
-at run time, with no false alarms; the compiler finds none of them by construction.
+**On 221 auto-generated, compile-clean mutations of the real eShop code in seven classes, Ripple finds every consumer
+service each one breaks at run time, with no false alarms.** The compiler finds none of them, by construction. Read the
+method and the limits below before quoting the 100%: the classes are the ones eShop's code can express.
 
 | Approach | Precision | Recall | TP | FP | FN | Exact |
 |---|---|---|---|---|---|---|
@@ -357,7 +413,10 @@ that break nothing. *Exact* counts mutations where the approach flagged precisel
   no longer routed to it (event renamed), or if a JSON path it *uses* comes back different.
 - **"Uses"** comes from a separate usage oracle (Roslyn `SymbolFinder` over the consumer's copy, plus whole-event
   forwarding). This half is a second implementation rather than an independent measurement, so its labels are exported
-  for review in [`eval/usage-labels.tsv`](eval/usage-labels.tsv) (36 service/contract/field triples).
+  for review in [`eval/usage-labels.tsv`](eval/usage-labels.tsv) (34 service/contract/field triples). An independent
+  hand audit of all 18 handlers and every consumer copy agreed with all 34 (an earlier version had two wrong rows —
+  the inherited `Id` counted wherever any event's `Id` was read — which also affected Ripple's `READS` edges; both
+  are fixed and attribute a read only to the copy its receiver expression has).
 - **Baselines.** *grep*: a consumer file mentions both the event name and the changed member. *Topology*: every
   service subscribed to the changed contract (what a service map knows). *Schema diff*: Ripple's graph without `READS`
   — every consumer whose copy declares a field the publisher no longer sends or types differently (what a schema
@@ -368,7 +427,9 @@ that break nothing. *Exact* counts mutations where the approach flagged precisel
 - The gap between *Schema diff* (48 false positives) and Ripple (0) is the value of modelling which fields each
   consumer actually reads: a schema registry would flag every unused field of every subscriber.
 - *Handler body only* scores the same as full Ripple: eShop's handlers read event fields inline, so this benchmark does
-  not exercise read propagation through `CALLS`.
+  not exercise read propagation through `CALLS`. Multi-hop traversal is shown instead by the order saga above.
+- `widen` and `nullable` breaks need an edge-case value (above `int.MaxValue`, or `null`) to actually be sent; the
+  oracle sends one on purpose. Ripple reports them as schema-level type drift.
 - The classes above are the ones eShop's code can express. Ripple is known to miss enum-member renames inside
   string-serialised enums, global naming policies or converters registered at run time, `[JsonIgnore(Condition = …)]`,
   reads behind reflection or positional deconstruction, and reads more than 3 calls from the handler (see Limitations).
@@ -421,7 +482,7 @@ build output would go to stdout, which is the MCP channel.)
 ```
 
 Tools: `graph_schema`, `list_contracts`, `contract_breaks`, `what_breaks_if_field_changes`, `find_methods`,
-`impact_of_method`, `service_risk`, `run_cypher` (read-only: `GRAPH.RO_QUERY`, FalkorDB rejects writes).
+`impact_of_method`, `event_cascade`, `service_risk`, `run_cypher` (read-only: `GRAPH.RO_QUERY`, FalkorDB rejects writes).
 
 ### In FalkorDB Browser
 
@@ -440,8 +501,8 @@ RETURN p
 While building Ripple we hit three query-planner issues in FalkorDB (module 60002); see
 [`docs/falkordb-cartesian-repro.md`](docs/falkordb-cartesian-repro.md). The first one silently turned a type-drift
 check into a cross product of unrelated contracts. Every Ripple query now projects with `WITH` after its first filter
-and joins on inline pattern properties, and `ripple selfcheck` runs `GRAPH.EXPLAIN` on all of them and fails if any
-plan contains a Cartesian Product or a Value Hash Join.
+and joins on inline pattern properties, and `ripple selfcheck` runs `GRAPH.EXPLAIN` on every read query (the derive
+and write queries are excluded) and fails if any plan contains a Cartesian Product or a Value Hash Join.
 
 ---
 

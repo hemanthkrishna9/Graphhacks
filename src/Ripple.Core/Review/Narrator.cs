@@ -75,7 +75,11 @@ public static class Narrator
         {
             var f = groups[i][0];
             sb.AppendLine($"{i + 1}. kind={f.Kind} contract={f.Contract} publisher={f.PublisherService} consumer={f.ConsumerService} handler={f.Handler}");
-            foreach (var x in groups[i]) sb.AppendLine($"   path={x.Path} expected={x.Expected} actual={x.Actual ?? "missing"} reader={x.Reader}");
+            foreach (var x in groups[i])
+            {
+                var actual = x.Actual ?? (x.Kind is "dangling-read" or "dangling-forward" ? "missing in publisher" : "n/a");
+                sb.AppendLine($"   path={x.Path} expected={x.Expected ?? "n/a"} actual={actual} reader={x.Reader ?? "n/a"}");
+            }
         }
         sb.AppendLine("\nDiff:\n" + (diff.Length > 20000 ? diff[..20000] + "\n[diff truncated]" : diff));
         return sb.ToString();

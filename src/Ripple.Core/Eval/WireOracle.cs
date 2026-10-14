@@ -19,10 +19,12 @@ public sealed class WireOracle : IDisposable
     // eShop's EventBusSubscriptionInfo.DefaultSerializerOptions: reflection resolver, no naming policy, case-sensitive.
     static readonly JsonSerializerOptions EventBusOptions = new() { TypeInfoResolver = new DefaultJsonTypeInfoResolver() };
 
-    static readonly string[] SharedFrameworkDirs = Directory.Exists("/usr/lib/dotnet/shared")
-        ? Directory.GetDirectories("/usr/lib/dotnet/shared").SelectMany(Directory.GetDirectories).ToArray()
-        : [];
     static readonly string RuntimeDir = Path.GetDirectoryName(typeof(object).Assembly.Location)!;
+
+    // <dotnet root>/shared/<framework>/<version>: every installed shared framework (ASP.NET Core and so on).
+    static readonly string[] SharedFrameworkDirs = Directory.GetParent(RuntimeDir)?.Parent is { Exists: true } shared
+        ? shared.GetDirectories().SelectMany(f => f.GetDirectories()).Select(d => d.FullName).ToArray()
+        : [];
 
     readonly Dictionary<(ProjectId, VersionStamp), byte[]> _emitted = new();
 
@@ -51,8 +53,9 @@ public sealed class WireOracle : IDisposable
                     var lost = seen.Where(kv => !sent.TryGetValue(kv.Key, out var v) || v != kv.Value).Select(kv => kv.Key).ToHashSet(StringComparer.Ordinal);
                     results[project.AssemblyName] = new Result(false, null, lost, json);
                 }
-                catch (Exception e) when (e is JsonException or NotSupportedException or InvalidOperationException or FormatException or OverflowException)
+                catch (Exception e) when (e is not OutOfMemoryException)
                 {
+                    // Anything the consumer's deserialisation throws (JSON errors, constructor exceptions...) loses the message.
                     results[project.AssemblyName] = new Result(true, e.Message, new HashSet<string>(), json);
                 }
             }
@@ -206,6 +209,12 @@ static class Sentinels
             var array = Array.CreateInstance(element, 1);
             array.SetValue(Value(element, adversarial, depth + 1), 0);
             return array;
+        }
+        if (type.IsGenericType && type.GetGenericArguments().Length == 2 && typeof(System.Collections.IDictionary).IsAssignableFrom(
+                typeof(Dictionary<,>).MakeGenericType(type.GetGenericArguments())))
+        {
+            var dictionaryType = typeof(Dictionary<,>).MakeGenericType(type.GetGenericArguments());
+            return type.IsAssignableFrom(dictionaryType) ? Activator.CreateInstance(dictionaryType) : null;
         }
         if (type.IsGenericType && type.GetGenericArguments().Length == 1
             && typeof(System.Collections.IEnumerable).IsAssignableFrom(type) || type.IsInterface && type.IsGenericType)

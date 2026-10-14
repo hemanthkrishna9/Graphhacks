@@ -74,7 +74,7 @@ public static class RippleQueries
     /// <summary>Publisher wire type > consumer wire type pairs that always deserialise (System.Text.Json defaults).</summary>
     public static readonly string[] Compatible =
     [
-        "int32>int64", "int32>decimal", "int32>double", "int64>decimal", "int64>double", "decimal>double", "double>decimal",
+        "int32>int64", "int32>decimal", "int32>double", "int64>decimal", "int64>double", "decimal>double",
         "guid>string", "datetime>string", "enum:string>string", "enum:number>int32", "enum:number>int64",
     ];
 
@@ -168,6 +168,31 @@ public static class RippleQueries
         MATCH (b:Service {key: publisher})
         MERGE (a)-[d:DEPENDS_ON]->(b)
         SET d.contracts = contracts, d.weight = size(contracts)
+        """;
+
+    /// <summary>
+    /// Derived edge: (publisher method)-[:TRIGGERS {contracts}]->(handler in another service). Folds the five-hop contract
+    /// path into one edge so whole cascades (handler -> command -> domain event -> publish -> next service's handler -> ...)
+    /// become a single variable-length traversal over CALLS|TRIGGERS.
+    /// </summary>
+    public const string MaterializeTriggers = """
+        MATCH (pub:Method)-[:PUBLISHES]->(:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(:EventShape)<-[:HANDLES]-(h:Method)
+        WHERE pub.service <> h.service
+        WITH pub, h, collect(DISTINCT c.name) AS contracts
+        MERGE (pub)-[t:TRIGGERS]->(h)
+        SET t.contracts = contracts, t.source = 'inferred', t.via = 'event-bus'
+        """;
+
+    /// <summary>
+    /// Q9 — Event cascade: every handler, in any service, that runs as a consequence of this method — through calls,
+    /// MediatR, domain events and integration events, across as many services as the chain goes (up to 14 hops).
+    /// </summary>
+    public const string EventCascade = """
+        MATCH (m:Method {key: $key})
+        MATCH p = (m)-[:CALLS|TRIGGERS*1..14]->(h:Method)
+        WHERE h.name = 'Handle' AND h.service <> m.service
+        RETURN h.service AS service, h.type AS handler, min(length(p)) AS hops
+        ORDER BY hops, service, handler
         """;
 
     /// <summary>

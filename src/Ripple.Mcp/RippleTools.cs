@@ -31,7 +31,7 @@ public static class RippleTools
         JsonSerializer.Serialize(store.Query(ToolQueries.Contracts), Json);
 
     [McpServerTool(Name = "contract_breaks", ReadOnly = true),
-     Description("Run Ripple's contract checks on the current graph: dangling reads, dangling forwards, type drift, unfillable reads and starved subscriptions. Optionally narrow to one contract (event name).")]
+     Description("Run Ripple's contract checks on the current graph: dangling reads, dangling forwards, type drift, unfillable reads, unbindable constructors and starved subscriptions. Optionally narrow to one contract (event name).")]
     public static string ContractBreaks(GraphStore store,
         [Description("Integration event name, e.g. OrderStatusChangedToPaidIntegrationEvent. Omit for all contracts.")] string? contract = null) =>
         JsonSerializer.Serialize(ContractChecker.Run(store, contract), Json);
@@ -62,6 +62,12 @@ public static class RippleTools
             callers = store.Query(RippleQueries.Callers, p),
         }, Json);
     }
+
+    [McpServerTool(Name = "event_cascade", ReadOnly = true),
+     Description("Everything that runs, in every service, as a consequence of this method: follows calls, MediatR commands, domain events and integration events across services (up to 14 hops). Use find_methods to get the key.")]
+    public static string EventCascade(GraphStore store,
+        [Description("Method key from find_methods (\"{assembly}|{fqn}\")")] string key) =>
+        JsonSerializer.Serialize(store.Query(RippleQueries.EventCascade, new Dictionary<string, object?> { ["key"] = key }), Json);
 
     [McpServerTool(Name = "service_risk", ReadOnly = true),
      Description("Rank services by how much of the event-driven system runs through them: betweenness centrality (bridgeScore) and PageRank (dependencyRank) over the service dependency graph derived from integration events, with who consumes what from whom.")]

@@ -11,6 +11,7 @@ public static class Indexer
     public static void Derive(GraphStore graph)
     {
         graph.Execute(Queries.RippleQueries.MaterializeDependsOn);
+        graph.Execute(Queries.RippleQueries.MaterializeTriggers);
         graph.Execute(Queries.RippleQueries.BridgeScores);
         graph.Execute(Queries.RippleQueries.DependencyRank);
     }

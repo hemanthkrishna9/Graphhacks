@@ -38,7 +38,9 @@ public sealed class CodeGraphExtractor
 
     // Property symbol (of an event type or a type nested in one) -> every (shape, wire path) it appears at.
     // Keyed by string ("{assembly}|{fqn}"), not by symbol: the same type seen from two projects is two different symbols.
-    readonly Dictionary<string, List<(string ShapeKey, string Path)>> _propertyPaths = new(StringComparer.Ordinal);
+    // Owner = the shape or nested type the path belongs to; an inherited property (e.g. IntegrationEvent.Id) has one entry
+    // per owner, and a read is attributed only to the owner its receiver expression has.
+    readonly Dictionary<string, List<(string ShapeKey, string Path, string Owner)>> _propertyPaths = new(StringComparer.Ordinal);
     readonly HashSet<string> _shapeTypes = new(StringComparer.Ordinal);
 
     // Dispatch tables for inferred edges.
@@ -252,8 +254,12 @@ public sealed class CodeGraphExtractor
             if (IsWrite(id) || IsInsideType(id, model, prop.ContainingType)) return;
             if (EnclosingMethod(id, model) is not { } reader) return;
             var context = IsLoggingArgument(id, model) ? "log" : "code";
-            foreach (var (shapeKey, path) in paths)
+            var receiver = ReceiverType(id, model) is INamedTypeSymbol r ? TypeKey(r.OriginalDefinition) : null;
+            var declaring = TypeKey(prop.ContainingType.OriginalDefinition);
+            foreach (var (shapeKey, path, owner) in paths)
             {
+                // Known receiver: only that owner's path. Unknown receiver (e.g. a property pattern): only non-inherited paths.
+                if (receiver is not null ? owner != receiver : owner != declaring) continue;
                 _batch.Edge("READS", "Method", MethodKey(reader), "Property", $"{shapeKey}|{path}",
                     ("source", "syntactic"), ("line", Line(id)), ("context", context));
             }
@@ -340,7 +346,7 @@ public sealed class CodeGraphExtractor
 
             var definition = PropertyKey(prop);
             if (!_propertyPaths.TryGetValue(definition, out var list)) _propertyPaths[definition] = list = [];
-            list.Add((shapeKey, path));
+            list.Add((shapeKey, path, type is INamedTypeSymbol owner ? TypeKey((INamedTypeSymbol)owner.OriginalDefinition) : ""));
 
             if (depth < MaxShapeDepth && IsComposite(valueType))
                 FlattenShape(shapeKey, valueType, path + (element is null ? "." : "[]."), depth + 1, visiting, unbound);
@@ -483,6 +489,19 @@ public sealed class CodeGraphExtractor
         while (symbol is IMethodSymbol { MethodKind: MethodKind.LambdaMethod or MethodKind.LocalFunction or MethodKind.AnonymousFunction })
             symbol = symbol.ContainingSymbol;
         return symbol is IMethodSymbol m && IsIndexableMethod(m) && IsOurs(m) ? m : null;
+    }
+
+    /// <summary>Static type of the expression a member is read from (`x.Prop`, `x?.Prop`), or null if not syntactically obvious.</summary>
+    static ITypeSymbol? ReceiverType(IdentifierNameSyntax id, SemanticModel model)
+    {
+        ExpressionSyntax? receiver = id.Parent switch
+        {
+            MemberAccessExpressionSyntax ma when ma.Name == id => ma.Expression,
+            MemberBindingExpressionSyntax mb when mb.Name == id => mb.FirstAncestorOrSelf<ConditionalAccessExpressionSyntax>()?.Expression,
+            _ => null,
+        };
+        var type = receiver is null ? null : model.GetTypeInfo(receiver).Type;
+        return type is INamedTypeSymbol { OriginalDefinition.SpecialType: SpecialType.System_Nullable_T } n ? n.TypeArguments[0] : type;
     }
 
     static bool IsWrite(IdentifierNameSyntax id)

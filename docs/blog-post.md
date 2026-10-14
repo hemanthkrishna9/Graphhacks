@@ -13,8 +13,8 @@ Here is a pull request to Microsoft's eShop reference app:
 ```
 
 It builds. Every test passes. An AI reviewer looking at the diff says it's a harmless rename. In production, the
-Catalog service stops decrementing stock and starts confirming orders it can't fill, and the Webhooks service starts
-telling external subscribers that every order line has zero units.
+Catalog service confirms orders it can't fill and throws on every paid order (so stock never goes down), and the
+Webhooks service tells external subscribers that every order line has zero units.
 
 ## Why nothing catches it
 
@@ -71,8 +71,10 @@ To find out, we built a benchmark that doesn't trust Ripple:
 | Schema diff (Ripple's graph without `READS`) | 78% | 100% |
 | **Ripple** | **100%** | **100%** |
 
-The interesting row is the schema diff. It's what a schema registry would tell you: every subscriber whose copy of the
-event declares a changed field. It catches everything, but it raised 48 false alarms on fields nobody reads. The `READS`
+(on 221 auto-generated, compile-clean mutations in seven classes; per consumer service)
+
+The interesting row is the schema diff. It's a proxy for what a schema-registry compatibility check would tell you: every
+subscriber whose copy of the event declares a changed field. It catches everything, but it raised 48 false alarms on fields nobody reads. The `READS`
 edges are what remove those alarms, and they only exist because the graph connects the contract down to individual
 lines of consumer code.
 

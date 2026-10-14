@@ -92,7 +92,7 @@ public sealed class MutationEval(LoadedSolution loaded, GraphStore store, Action
                 if (isPublisher)
                     list.Add(new Mutation("event-rename", project.Name, type.GetDocumentationCommentId()!, type.Name, "", [(type.Name, "")]));
 
-                foreach (var (prop, path) in Walk(type, ""))
+                foreach (var (prop, path, _) in Walk(type, ""))
                 {
                     if (!SymbolEqualityComparer.Default.Equals(prop.ContainingAssembly, compilation.Assembly)) continue;   // base IntegrationEvent
                     var id = prop.GetDocumentationCommentId()!;
@@ -268,13 +268,18 @@ public sealed class MutationEval(LoadedSolution loaded, GraphStore store, Action
 
         var used = new HashSet<string>(StringComparer.Ordinal);
         var documents = project.Documents.ToImmutableHashSet();
-        foreach (var (prop, path) in all)
+        foreach (var (prop, path, owner) in all)
         {
             foreach (var location in (await SymbolFinder.FindReferencesAsync(prop, solution, documents)).SelectMany(r => r.Locations))
             {
                 var node = (await location.Document.GetSyntaxRootAsync())!.FindNode(location.Location.SourceSpan);
                 var model = (await location.Document.GetSemanticModelAsync())!;
                 if (IsWrite(node) || IsInLoggingCall(node)) continue;
+                // An inherited property (IntegrationEvent.Id) is referenced on every event: count it only when the
+                // receiver is this copy (or the nested type that owns the path).
+                var receiver = node.Parent is MemberAccessExpressionSyntax ma && ma.Name == node ? model.GetTypeInfo(ma.Expression).Type : null;
+                if (receiver is not null ? !SymbolEqualityComparer.Default.Equals(receiver.OriginalDefinition, owner.OriginalDefinition)
+                                         : !SymbolEqualityComparer.Default.Equals(prop.ContainingType.OriginalDefinition, owner.OriginalDefinition)) continue;
                 if (node.FirstAncestorOrSelf<TypeDeclarationSyntax>() is { } decl
                     && SymbolEqualityComparer.Default.Equals(model.GetDeclaredSymbol(decl), prop.ContainingType)) continue;
                 used.Add(path);
@@ -408,7 +413,7 @@ public sealed class MutationEval(LoadedSolution loaded, GraphStore store, Action
     }
 
     /// <summary>(property, JSON path) pairs, honouring [JsonPropertyName] and [JsonIgnore].</summary>
-    static IEnumerable<(IPropertySymbol Prop, string Path)> Walk(ITypeSymbol type, string prefix, int depth = 0)
+    static IEnumerable<(IPropertySymbol Prop, string Path, ITypeSymbol Owner)> Walk(ITypeSymbol type, string prefix, int depth = 0)
     {
         var seen = new HashSet<string>(StringComparer.Ordinal);
         for (var t = type; t is not null && t.SpecialType != SpecialType.System_Object; t = t.BaseType)
@@ -420,7 +425,7 @@ public sealed class MutationEval(LoadedSolution loaded, GraphStore store, Action
                 if (p.GetAttributes().Any(a => a.AttributeClass?.Name == "JsonIgnoreAttribute")) continue;
                 var wire = p.GetAttributes().FirstOrDefault(a => a.AttributeClass?.Name == "JsonPropertyNameAttribute")?.ConstructorArguments[0].Value as string ?? p.Name;
                 var path = prefix + wire;
-                yield return (p, path);
+                yield return (p, path, type);
                 var element = ElementType(p.Type);
                 var value = element ?? p.Type;
                 if (depth < 4 && value.TypeKind is TypeKind.Class or TypeKind.Struct && value.SpecialType == SpecialType.None && value.Locations.Any(l => l.IsInSource))
