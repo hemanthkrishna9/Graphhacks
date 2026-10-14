@@ -42,17 +42,39 @@ switch (command)
         Report.PrintFindings(result.Introduced);
         return result.Introduced.Count == 0 ? 0 : 1;
     }
+    case "selfcheck":
+    {
+        // Guards against FalkorDB planning a query as a Cartesian product (see the note in RippleQueries).
+        var config = LoadConfig(options);
+        var store = new GraphStore(falkor, options.GetValueOrDefault("graph") ?? config.Graph);
+        var parameters = new Dictionary<string, object?>
+        {
+            ["contract"] = null, ["key"] = "", ["path"] = "", ["text"] = "",
+            ["compatible"] = Ripple.Core.Queries.RippleQueries.Compatible.Cast<object>().ToList(),
+        };
+        var failed = 0;
+        foreach (var (name, cypher) in Ripple.Core.Queries.RippleQueries.All())
+        {
+            var plan = store.Explain(cypher, parameters);
+            var bad = plan.Any(op => op.Contains("Cartesian Product"));
+            failed += bad ? 1 : 0;
+            Console.WriteLine($"{(bad ? "FAIL" : "ok  ")} {name}");
+        }
+        return failed == 0 ? 0 : 1;
+    }
     case "eval":
     {
         var config = LoadConfig(options);
         var loaded = await Ripple.Core.Extraction.SolutionLoader.LoadAsync(Require(options, "repo"), config.Services, Log);
         var store = new GraphStore(falkor, config.Graph + ".eval");
         var limit = options.GetValueOrDefault("limit") is { } l ? int.Parse(l) : (int?)null;
-        var report = await new Ripple.Core.Eval.MutationEval(loaded, store, Log).RunAsync(limit);
+        var kinds = options.GetValueOrDefault("kinds")?.Split(',').ToHashSet();
+        var report = await new Ripple.Core.Eval.MutationEval(loaded, store, Log).RunAsync(limit, kinds);
         var outDir = options.GetValueOrDefault("out") ?? "eval";
         Directory.CreateDirectory(outDir);
         File.WriteAllText(Path.Combine(outDir, "results.json"), System.Text.Json.JsonSerializer.Serialize(report,
             new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+        File.WriteAllLines(Path.Combine(outDir, "usage-labels.tsv"), new[] { "service\tcontract\tpath" }.Concat(report.UsageLabels));
         var md = EvalMarkdown.Render(report);
         File.WriteAllText(Path.Combine(outDir, "results.md"), md);
         Console.WriteLine(md);
@@ -64,7 +86,8 @@ switch (command)
               ripple ingest  --repo <path> [--graph <name>] [--config ripple.eshop.json]
               ripple check   [--graph <name>] [--contract <EventName>]
               ripple analyze --repo <path> --base <ref> --head <ref> [--reindex]
-              ripple eval    --repo <path> [--limit N] [--out eval]
+              ripple selfcheck [--graph <name>]   (EXPLAIN every query; fail on Cartesian plans)
+              ripple eval    --repo <path> [--limit N per kind] [--kinds rename,widen,...] [--out eval]
             options: --falkor host:port (or FALKORDB env var; default localhost:6379)
             """);
         return command == "help" ? 0 : 2;
@@ -116,25 +139,43 @@ static class EvalMarkdown
     public static string Render(Ripple.Core.Eval.EvalReport report)
     {
         var sb = new System.Text.StringBuilder();
-        var breaks = report.Cases.Count(c => c.Truth.Count > 0);
-        var controls = report.Cases.Count(c => c.Kind == "rename-keep");
-        sb.AppendLine($"Mutations: {report.Cases.Count} (all compile cleanly). Breaking: {breaks}. Wire-compatible controls: {controls}.");
-        sb.AppendLine("Scored per (mutation, consumer service). \"Breaks caught\" = mutations whose broken services were all found and nothing else.");
+        var breaking = report.Cases.Count(c => c.Truth.Count > 0);
+        sb.AppendLine($"Mutations: {report.Cases.Count}, all of which compile (the compiler catches none, by construction). " +
+                      $"{breaking} break at least one consumer at the wire; {report.Cases.Count - breaking} break nothing.");
+        sb.AppendLine("Scored per (mutation, consumer service). Exact = the approach flagged precisely the broken services (including none).");
         sb.AppendLine();
-        sb.AppendLine("| Approach | Precision | Recall | TP | FP | FN | Breaks caught exactly | Controls wrongly flagged |");
-        sb.AppendLine("|---|---|---|---|---|---|---|---|");
-        foreach (var s in report.Scores())
+        Table(sb, report.Scores());
+        foreach (var kind in report.Cases.Select(c => c.Kind).Distinct())
         {
-            var precision = s.TruePositives + s.FalsePositives == 0 ? "n/a" : s.Precision.ToString("P0");
-            sb.AppendLine($"| {s.Approach} | {precision} | {s.Recall:P0} | {s.TruePositives} | {s.FalsePositives} | {s.FalseNegatives} | {s.BreaksCaught}/{s.Breaks} | {s.ControlsFlagged}/{s.Controls} |");
+            var n = report.Cases.Count(c => c.Kind == kind);
+            sb.AppendLine($"### {kind} ({n} mutations, {report.Cases.Count(c => c.Kind == kind && c.Truth.Count > 0)} breaking)");
+            sb.AppendLine();
+            Table(sb, report.Scores(kind));
         }
+        sb.AppendLine("### Every mutation");
         sb.AppendLine();
-        sb.AppendLine("| Mutation | Kind | Truth | Ripple | grep | Call graph |");
-        sb.AppendLine("|---|---|---|---|---|---|");
+        sb.AppendLine("| Kind | Mutation | Truth (wire) | Ripple | Schema diff | Topology | grep | Wire notes |");
+        sb.AppendLine("|---|---|---|---|---|---|---|---|");
         foreach (var c in report.Cases)
-            sb.AppendLine($"| {c.Mutation} | {c.Kind} | {Join(c.Truth)} | {Join(c.Ripple)} | {Join(c.Grep)} | {Join(c.CallGraph)} |");
+            sb.AppendLine($"| {c.Kind} | {c.Mutation} | {J(c.Truth)} | {Mark(c, "Ripple")} | {Mark(c, "Schema diff (no READS)")} | {Mark(c, "Topology")} | {Mark(c, "grep")} | {string.Join("; ", c.WireNotes).Replace("|", "/")} |");
         return sb.ToString();
     }
 
-    static string Join(IReadOnlyList<string> xs) => xs.Count == 0 ? "-" : string.Join(", ", xs);
+    static void Table(System.Text.StringBuilder sb, IReadOnlyList<Ripple.Core.Eval.EvalReport.Score> scores)
+    {
+        sb.AppendLine("| Approach | Precision | Recall | TP | FP | FN | Exact |");
+        sb.AppendLine("|---|---|---|---|---|---|---|");
+        foreach (var s in scores)
+            sb.AppendLine($"| {s.Approach} | {(s.Precision is { } p ? p.ToString("P0") : "n/a")} | {s.Recall:P0} | {s.TruePositives} | {s.FalsePositives} | {s.FalseNegatives} | {s.Exact}/{s.Cases} |");
+        sb.AppendLine();
+    }
+
+    static string Mark(Ripple.Core.Eval.EvalCase c, string approach)
+    {
+        var p = c.Predictions[approach];
+        var ok = p.ToHashSet().SetEquals(c.Truth);
+        return (ok ? "✓ " : "✗ ") + J(p);
+    }
+
+    static string J(IReadOnlyList<string> xs) => xs.Count == 0 ? "-" : string.Join(", ", xs);
 }

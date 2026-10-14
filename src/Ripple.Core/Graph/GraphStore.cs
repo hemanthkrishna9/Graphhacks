@@ -111,5 +111,9 @@ public sealed class GraphStore
         return rows;
     }
 
+    /// <summary>The execution plan FalkorDB would use (GRAPH.EXPLAIN), one operation per line.</summary>
+    public IReadOnlyList<string> Explain(string cypher, IDictionary<string, object?>? parameters = null) =>
+        _graph.Explain(cypher, (parameters ?? new Dictionary<string, object?>()).ToDictionary(kv => kv.Key, kv => kv.Value!)).ToList();
+
     public void Execute(string cypher, IDictionary<string, object?>? parameters = null) => Query(cypher, parameters, readOnly: false);
 }

@@ -15,8 +15,11 @@ public sealed record Finding(
     string? Expected,
     string? Actual)
 {
-    /// <summary>Stable identity used to diff base vs head findings.</summary>
-    public string Id => string.Join("|", Kind, Contract, PublisherService, ConsumerService, Handler, Path);
+    /// <summary>
+    /// Stable identity used to diff base vs head findings: what breaks, where, and how — not which handler class
+    /// (renaming a handler must not look like one finding resolved and another introduced).
+    /// </summary>
+    public string Id => string.Join("|", Kind, Contract, PublisherService, ConsumerService, Path, Expected, Actual);
 
     public static Finding FromRow(IReadOnlyDictionary<string, object?> row, string check, string severity) => new(
         Str(row, "kind")!, severity, check, Str(row, "contract")!,

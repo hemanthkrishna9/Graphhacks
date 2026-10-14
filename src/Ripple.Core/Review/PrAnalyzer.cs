@@ -35,7 +35,8 @@ public sealed class PrAnalyzer(RippleConfig config, GraphStore store, Action<str
 
     async Task<GraphStore> EnsureGraphAsync(string repo, string sha, bool reindex)
     {
-        var graph = store.WithGraph($"{config.Graph}@{sha[..10]}");
+        // Cache by commit AND extractor build: a graph built by an older extractor is never reused.
+        var graph = store.WithGraph($"{config.Graph}@{sha[..10]}.{ExtractorVersion}");
         if (graph.Exists() && !reindex)
         {
             log($"using cached graph {graph.Name}");
@@ -43,15 +44,25 @@ public sealed class PrAnalyzer(RippleConfig config, GraphStore store, Action<str
         }
 
         var worktree = Path.Combine(Path.GetTempPath(), "ripple-worktrees", sha[..10]);
+        var restored = Path.Combine(worktree, ".ripple-restored");
         if (!Directory.Exists(worktree))
         {
+            Git(repo, "worktree", "prune");
             Git(repo, "worktree", "add", "--detach", worktree, sha);
+        }
+        if (!File.Exists(restored))
+        {
             foreach (var project in config.Services)
                 Run("dotnet", worktree, "restore", project, "-v", "q");
+            File.WriteAllText(restored, sha);
         }
         await Indexer.IndexAsync(worktree, config, graph, log);
         return graph;
     }
+
+    /// <summary>Short id of the Ripple.Core build that produced a graph (changes whenever the extractor is rebuilt).</summary>
+    public static readonly string ExtractorVersion =
+        typeof(PrAnalyzer).Assembly.ManifestModule.ModuleVersionId.ToString("N")[..8];
 
     static string Git(string repo, params string[] args) => Run("git", repo, args);
 

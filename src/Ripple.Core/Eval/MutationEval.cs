@@ -12,211 +12,367 @@ using Ripple.Core.Review;
 namespace Ripple.Core.Eval;
 
 /// <summary>
-/// Automated mutation benchmark. For every property of every published integration event, apply two compile-safe
-/// mutations on the publisher side with Roslyn's Renamer:
-///   rename        — P becomes PRenamed (the JSON wire name changes: a contract break)
-///   rename-keep   — the same rename plus [JsonPropertyName("P")] (wire format unchanged: a control, nothing breaks)
-/// Each mutation is scored at (mutation, consumer service) granularity against an oracle, for four approaches:
-/// the compiler, a grep baseline, a call-graph-only ablation (no contract layer) and Ripple.
+/// Automated mutation benchmark. Every mutation is applied with Roslyn to the real eShop solution and must compile
+/// (so the compiler catches none of them by construction). Classes:
+///   rename          publisher renames an event property                         (wire name changes)
+///   rename-keep     same rename plus [JsonPropertyName(old)]                   (control: wire unchanged)
+///   json-ignore     publisher adds [JsonIgnore] to a property                   (field no longer sent)
+///   nullable        publisher makes a value-type property nullable              (may send null)
+///   widen           publisher changes int to long                               (may send values > int.MaxValue)
+///   consumer-rename a consumer renames its copy's property                      (reads a field nobody sends)
+///   event-rename    publisher renames the event class                           (routing key changes)
 ///
-/// The oracle does not use the graph: it walks consumer copies of the contract with Roslyn's SymbolFinder and calls a
-/// consumer broken when code in that service reads the property at the changed wire path, or passes the whole event to
-/// an untyped parameter (serialisation).
+/// Ground truth per (mutation, consumer service) = the consumer handles the contract AND, at the wire
+/// (<see cref="WireOracle"/>: real System.Text.Json round-trip with adversarial values), deserialisation throws, or the
+/// message is no longer routed to it, or a JSON path it uses comes back different. "Uses" comes from a usage oracle
+/// (Roslyn SymbolFinder over the consumer's copy, plus whole-event forwarding) — exported as labels for hand review.
 /// </summary>
 public sealed class MutationEval(LoadedSolution loaded, GraphStore store, Action<string> log)
 {
-    public async Task<EvalReport> RunAsync(int? limit = null)
+    public static readonly string[] Kinds = ["rename", "rename-keep", "json-ignore", "nullable", "widen", "consumer-rename", "event-rename"];
+
+    readonly HashSet<string> _deployables = loaded.Services.Select(s => s.Project.AssemblyName).ToHashSet(StringComparer.Ordinal);
+    readonly WireOracle _wire = new();
+
+    public async Task<EvalReport> RunAsync(int? limitPerKind = null, IReadOnlySet<string>? kinds = null)
     {
         var baseSolution = loaded.Solution;
-        var deployables = loaded.Services.Select(s => s.Project.AssemblyName).ToHashSet(StringComparer.Ordinal);
-
         log("indexing baseline");
         var baseBatch = await new CodeGraphExtractor(loaded).ExtractAsync();
         baseBatch.PruneDanglingEdges();
         var baseGraph = store.WithGraph(store.Name + ".base");
         baseGraph.Replace(baseBatch);
-        var baselineIds = ContractChecker.Run(baseGraph).Select(f => f.Id).ToHashSet();
+        var baseline = Approaches.ToDictionary(a => a.Name, a => a.Run(baseGraph).Select(f => f.Id).ToHashSet());
 
-        var targets = await EnumerateTargetsAsync(baseSolution, baseBatch);
-        log($"{targets.Count} publisher-side event properties to mutate");
-        if (limit is { } n) targets = targets.Take(n).ToList();
-
+        var mutations = await EnumerateMutationsAsync(baseSolution);
+        log($"{mutations.Count} candidate mutations");
         var cases = new List<EvalCase>();
-        foreach (var target in targets)
+        var labels = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var group in mutations.GroupBy(m => m.Kind))
         {
-            foreach (var kind in new[] { "rename", "rename-keep" })
+            if (kinds is not null && !kinds.Contains(group.Key)) continue;
+            foreach (var mutation in limitPerKind is { } n ? group.Take(n) : group)
             {
-                var mutated = await MutateAsync(baseSolution, target, kind);
-                if (mutated is null) { log($"skip {kind} {target.Label}: does not compile"); continue; }
+                var mutated = await ApplyAsync(baseSolution, mutation);
+                if (mutated is null) { log($"skip {mutation.Label}: does not compile"); continue; }
 
-                var truth = kind == "rename" ? await OracleAsync(baseSolution, target, deployables) : [];
-                var grep = GrepBaseline(target, deployables);
-                var callGraph = CallGraphBaseline(baseGraph, target, deployables);
-
-                var mutatedLoaded = loaded with { Solution = mutated };
-                var batch = await new CodeGraphExtractor(mutatedLoaded).ExtractAsync();
-                batch.PruneDanglingEdges();
-                store.Replace(batch);
-                var introduced = ContractChecker.Run(store).Where(f => !baselineIds.Contains(f.Id)).ToList();
-                var ripple = introduced.Select(f => f.ConsumerService).ToHashSet(StringComparer.Ordinal);
-
-                var c = new EvalCase(target.Label, kind, target.PublisherService, truth.Order().ToList(),
-                    Compiler: [], Grep: grep.Order().ToList(), CallGraph: callGraph.Order().ToList(), Ripple: ripple.Order().ToList(),
-                    RippleFindings: introduced.Select(f => $"{f.Kind} {f.Contract} -> {f.ConsumerService} {f.Path}").Distinct().ToList());
+                EvalCase c;
+                try { c = await ScoreAsync(mutated, mutation, baseGraph, baseline, labels); }
+                catch (Exception e) { log($"skip {mutation.Label}: oracle error {e.GetType().Name}: {e.Message}"); continue; }
                 cases.Add(c);
-                log($"{kind,-11} {target.Label}: truth [{string.Join(",", c.Truth)}] ripple [{string.Join(",", c.Ripple)}] " +
-                    $"grep [{string.Join(",", c.Grep)}] callgraph [{string.Join(",", c.CallGraph)}]");
+                log($"{c.Kind,-15} {c.Mutation}: truth [{string.Join(",", c.Truth)}] ripple [{string.Join(",", c.Predictions["Ripple"])}]");
             }
         }
-        return new EvalReport(cases);
+        store.Drop();   // the scratch graph only ever holds the last mutant
+        return new EvalReport(cases, labels.ToList());
     }
 
-    // ---------------------------------------------------------------- targets
+    // ---------------------------------------------------------------- mutations
 
-    public sealed record Target(
-        string PublisherService, string TypeName, string PropertyName, string SymbolId, string ProjectName,
-        IReadOnlyList<(string Contract, string Path)> WirePaths)
+    public sealed record Mutation(string Kind, string Project, string SymbolId, string TypeName, string Member, IReadOnlyList<(string Contract, string Path)> WirePaths)
     {
-        public string Label => $"{PublisherService}:{TypeName}.{PropertyName}";
+        public string Label => $"{Project}:{TypeName}{(Member.Length > 0 ? "." + Member : "")}";
+        public bool ConsumerSide => Kind == "consumer-rename";
     }
 
-    /// <summary>Source properties of published event shapes (and types nested in them), excluding the shared base event.</summary>
-    async Task<List<Target>> EnumerateTargetsAsync(Solution solution, GraphBatch baseBatch)
+    async Task<List<Mutation>> EnumerateMutationsAsync(Solution solution)
     {
-        var published = baseBatch.Edges.Keys.Where(e => e.Type == "PUBLISHES").Select(e => e.ToKey).ToHashSet(StringComparer.Ordinal);
-        var byProperty = new Dictionary<string, (IPropertySymbol Symbol, Project Project, List<(string, string)> Paths)>(StringComparer.Ordinal);
-
-        foreach (var project in solution.Projects.Where(p => loaded.Services.Any(s => s.Project.AssemblyName == p.AssemblyName)))
+        var list = new List<Mutation>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var project in DeployableProjects(solution))
         {
             var compilation = (await project.GetCompilationAsync())!;
-            foreach (var type in AllTypes(compilation.Assembly.GlobalNamespace))
+            var published = PublishedEventNames(compilation);
+            var handled = HandledEvents(compilation).Select(t => t.Name).ToHashSet(StringComparer.Ordinal);
+
+            foreach (var type in AllTypes(compilation.Assembly.GlobalNamespace).Where(CodeGraphExtractor.IsIntegrationEvent))
             {
-                if (!CodeGraphExtractor.IsIntegrationEvent(type) || !published.Contains(CodeGraphExtractor.TypeKey(type))) continue;
+                var isPublisher = published.Contains(type.Name);
+                var isConsumer = handled.Contains(type.Name) && !isPublisher;
+                if (isPublisher)
+                    list.Add(new Mutation("event-rename", project.Name, type.GetDocumentationCommentId()!, type.Name, "", [(type.Name, "")]));
+
                 foreach (var (prop, path) in Walk(type, ""))
                 {
-                    if (!SymbolEqualityComparer.Default.Equals(prop.ContainingAssembly, compilation.Assembly)) continue;   // base IntegrationEvent props
+                    if (!SymbolEqualityComparer.Default.Equals(prop.ContainingAssembly, compilation.Assembly)) continue;   // base IntegrationEvent
                     var id = prop.GetDocumentationCommentId()!;
-                    if (!byProperty.TryGetValue(id, out var entry)) byProperty[id] = entry = (prop, project, []);
-                    entry.Paths.Add((type.Name, path));
+                    var kinds = new List<string>();
+                    if (isPublisher)
+                    {
+                        kinds.AddRange(["rename", "rename-keep", "json-ignore"]);
+                        if (prop.Type.IsValueType && prop.Type.OriginalDefinition.SpecialType != SpecialType.System_Nullable_T) kinds.Add("nullable");
+                        if (prop.Type.SpecialType == SpecialType.System_Int32) kinds.Add("widen");
+                    }
+                    if (isConsumer) kinds.Add("consumer-rename");
+                    foreach (var kind in kinds)
+                        list.Add(new Mutation(kind, project.Name, id, prop.ContainingType.Name, prop.Name, [(type.Name, path)]));
                 }
             }
         }
-
-        return byProperty.Select(kv => new Target(
-                kv.Value.Project.AssemblyName, kv.Value.Symbol.ContainingType.Name, kv.Value.Symbol.Name, kv.Key, kv.Value.Project.Name,
-                kv.Value.Paths))
-            .OrderBy(t => t.Label, StringComparer.Ordinal).ToList();
+        // A nested type shared by several events is mutated once, with every (contract, path) it appears at.
+        return list.GroupBy(m => (m.Kind, m.Project, m.SymbolId))
+            .Select(g => g.First() with { WirePaths = g.SelectMany(m => m.WirePaths).Distinct().ToList() })
+            .OrderBy(m => Array.IndexOf(Kinds, m.Kind)).ThenBy(m => m.Label, StringComparer.Ordinal).ToList();
     }
 
-    static IEnumerable<(IPropertySymbol Prop, string Path)> Walk(ITypeSymbol type, string prefix, int depth = 0)
+    async Task<Solution?> ApplyAsync(Solution solution, Mutation m)
     {
-        foreach (var p in SerializedProperties(type))
-        {
-            var path = prefix + p.Name;
-            yield return (p, path);
-            var element = ElementType(p.Type);
-            var value = element ?? p.Type;
-            if (depth < 4 && value.TypeKind is TypeKind.Class or TypeKind.Struct && value.SpecialType == SpecialType.None && value.Locations.Any(l => l.IsInSource))
-                foreach (var inner in Walk(value, path + (element is null ? "." : "[]."), depth + 1))
-                    yield return inner;
-        }
-    }
-
-    // ---------------------------------------------------------------- mutation
-
-    async Task<Solution?> MutateAsync(Solution solution, Target target, string kind)
-    {
-        var project = solution.Projects.First(p => p.Name == target.ProjectName);
+        var project = solution.Projects.First(p => p.Name == m.Project);
         var compilation = (await project.GetCompilationAsync())!;
-        if (DocumentationCommentId.GetFirstSymbolForDeclarationId(target.SymbolId, compilation) is not IPropertySymbol symbol) return null;
+        var symbol = DocumentationCommentId.GetFirstSymbolForDeclarationId(m.SymbolId, compilation);
+        if (symbol is null) return null;
 
-        var newName = target.PropertyName + "Renamed";
-        var renamed = await Renamer.RenameSymbolAsync(solution, symbol, new SymbolRenameOptions(), newName);
-
-        if (kind == "rename-keep")
-            renamed = await KeepWireNameAsync(renamed, target, newName) ?? renamed;
-
-        // Every changed project (and its dependents) must still compile: these are "green build" mutations.
-        foreach (var changed in renamed.GetChanges(solution).GetProjectChanges().Select(c => c.ProjectId))
+        Solution? mutated = m.Kind switch
         {
-            var ids = new[] { changed }.Concat(renamed.GetProjectDependencyGraph().GetProjectsThatTransitivelyDependOnThisProject(changed));
+            "rename" or "consumer-rename" => await Renamer.RenameSymbolAsync(solution, symbol, new SymbolRenameOptions(), m.Member + "Renamed"),
+            "event-rename" => await Renamer.RenameSymbolAsync(solution, symbol, new SymbolRenameOptions(), m.TypeName.Replace("IntegrationEvent", "V2IntegrationEvent")),
+            "rename-keep" => await KeepWireNameAsync(await Renamer.RenameSymbolAsync(solution, symbol, new SymbolRenameOptions(), m.Member + "Renamed"), m),
+            "json-ignore" => await EditDeclarationAsync(solution, symbol, decl => AddPropertyAttribute(decl, "System.Text.Json.Serialization.JsonIgnore", null)),
+            "nullable" => await EditDeclarationAsync(solution, symbol, decl => ChangeType(decl, t => SyntaxFactory.NullableType(t.WithoutTrivia()).WithTriviaFrom(t))),
+            "widen" => await EditDeclarationAsync(solution, symbol, decl => ChangeType(decl, t => SyntaxFactory.ParseTypeName("long").WithTriviaFrom(t))),
+            _ => null,
+        };
+        if (mutated is null) return null;
+
+        // Every changed project and everything depending on it must compile: these are "green build" mutations.
+        foreach (var changed in mutated.GetChanges(solution).GetProjectChanges().Select(c => c.ProjectId))
+        {
+            var ids = new[] { changed }.Concat(mutated.GetProjectDependencyGraph().GetProjectsThatTransitivelyDependOnThisProject(changed));
             foreach (var id in ids.Distinct())
             {
-                var c = await renamed.GetProject(id)!.GetCompilationAsync();
+                var c = await mutated.GetProject(id)!.GetCompilationAsync();
                 if (c!.GetDiagnostics().Any(d => d.Severity == DiagnosticSeverity.Error)) return null;
             }
         }
-        return renamed;
+        return mutated;
     }
 
-    static async Task<Solution?> KeepWireNameAsync(Solution solution, Target target, string newName)
+    /// <summary>After a rename, pin the JSON name back to the old one. Returns null (mutation skipped) if that fails.</summary>
+    static async Task<Solution?> KeepWireNameAsync(Solution renamed, Mutation m)
     {
-        var project = solution.Projects.First(p => p.Name == target.ProjectName);
+        var project = renamed.Projects.First(p => p.Name == m.Project);
         var compilation = (await project.GetCompilationAsync())!;
-        var type = AllTypes(compilation.Assembly.GlobalNamespace).FirstOrDefault(t => t.Name == target.TypeName);
-        var prop = type?.GetMembers(newName).OfType<IPropertySymbol>().FirstOrDefault();
-        var syntaxRef = prop?.DeclaringSyntaxReferences.FirstOrDefault();
-        if (syntaxRef is null) return null;
+        var newId = m.SymbolId[..(m.SymbolId.LastIndexOf('.') + 1)] + m.Member + "Renamed";
+        var symbol = DocumentationCommentId.GetFirstSymbolForDeclarationId(newId, compilation);
+        return symbol is null ? null : await EditDeclarationAsync(renamed, symbol, decl => AddPropertyAttribute(decl, "System.Text.Json.Serialization.JsonPropertyName", $"\"{m.Member}\""));
+    }
 
+    static async Task<Solution?> EditDeclarationAsync(Solution solution, ISymbol symbol, Func<SyntaxNode, SyntaxNode?> edit)
+    {
+        var syntaxRef = symbol.DeclaringSyntaxReferences.FirstOrDefault();
+        if (syntaxRef is null) return null;
         var node = await syntaxRef.GetSyntaxAsync();
-        var attribute = SyntaxFactory.Attribute(
-            SyntaxFactory.ParseName("System.Text.Json.Serialization.JsonPropertyName"),
-            SyntaxFactory.ParseAttributeArgumentList($"(\"{target.PropertyName}\")"));
-        SyntaxNode replacement = node switch
-        {
-            PropertyDeclarationSyntax p => p.AddAttributeLists(SyntaxFactory.AttributeList(SyntaxFactory.SingletonSeparatedList(attribute))),
-            ParameterSyntax p => p.AddAttributeLists(SyntaxFactory.AttributeList(
-                SyntaxFactory.AttributeTargetSpecifier(SyntaxFactory.Token(SyntaxKind.PropertyKeyword)),
-                SyntaxFactory.SingletonSeparatedList(attribute))),
-            _ => node,
-        };
-        if (replacement == node) return null;
+        var replacement = edit(node);
+        if (replacement is null) return null;
         var document = solution.GetDocument(syntaxRef.SyntaxTree)!;
         var root = (await document.GetSyntaxRootAsync())!;
         return solution.WithDocumentSyntaxRoot(document.Id, root.ReplaceNode(node, replacement));
     }
 
-    // ---------------------------------------------------------------- oracle (no graph)
-
-    async Task<HashSet<string>> OracleAsync(Solution solution, Target target, HashSet<string> deployables)
+    static SyntaxNode? AddPropertyAttribute(SyntaxNode decl, string name, string? argument)
     {
-        var broken = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var project in solution.Projects.Where(p => deployables.Contains(p.AssemblyName) && p.AssemblyName != target.PublisherService))
+        var attribute = SyntaxFactory.Attribute(SyntaxFactory.ParseName(name),
+            argument is null ? null : SyntaxFactory.ParseAttributeArgumentList($"({argument})"));
+        var list = SyntaxFactory.AttributeList(SyntaxFactory.SingletonSeparatedList(attribute));
+        return decl switch
         {
-            var compilation = (await project.GetCompilationAsync())!;
-            foreach (var (contract, path) in target.WirePaths)
+            PropertyDeclarationSyntax p => p.AddAttributeLists(list),
+            ParameterSyntax p => p.AddAttributeLists(list.WithTarget(SyntaxFactory.AttributeTargetSpecifier(SyntaxFactory.Token(SyntaxKind.PropertyKeyword)))),
+            _ => null,
+        };
+    }
+
+    static SyntaxNode? ChangeType(SyntaxNode decl, Func<TypeSyntax, TypeSyntax> change) => decl switch
+    {
+        PropertyDeclarationSyntax p => p.WithType(change(p.Type)),
+        ParameterSyntax { Type: { } t } p => p.WithType(change(t)),
+        _ => null,
+    };
+
+    // ---------------------------------------------------------------- scoring
+
+    async Task<EvalCase> ScoreAsync(Solution mutated, Mutation m, GraphStore baseGraph,
+        Dictionary<string, HashSet<string>> baseline, SortedSet<string> labels)
+    {
+        var contracts = m.WirePaths.Select(p => p.Contract).Distinct().ToList();
+        var truth = new HashSet<string>(StringComparer.Ordinal);
+        var wireNotes = new List<string>();
+
+        if (m.Kind == "event-rename")
+        {
+            // Routing is by class name: every consumer of the old name is starved unless another service still publishes it.
+            var stillPublished = false;
+            foreach (var project in DeployableProjects(mutated))
+                stillPublished |= PublishedEventNames((await project.GetCompilationAsync())!).Contains(m.TypeName);
+            if (!stillPublished)
+                foreach (var project in DeployableProjects(mutated).Where(p => p.Name != m.Project))
+                    if (HandledEvents((await project.GetCompilationAsync())!).Any(t => t.Name == m.TypeName))
+                    {
+                        truth.Add(project.AssemblyName);
+                        wireNotes.Add($"{project.AssemblyName}: no longer routed");
+                    }
+        }
+        else
+        {
+            foreach (var contract in contracts)
             {
-                // The consumer's own copy of the contract, and only if this service actually handles it.
-                var copy = AllTypes(compilation.Assembly.GlobalNamespace).FirstOrDefault(t => t.Name == contract && CodeGraphExtractor.IsIntegrationEvent(t));
-                if (copy is null || !Handles(compilation, copy)) continue;
-
-                // A field the consumer's copy doesn't declare never arrived anyway: renaming it can't break this consumer.
-                var prop = Walk(copy, "").Where(x => x.Path == path).Select(x => x.Prop).FirstOrDefault();
-                if (prop is null) continue;
-                if (await ForwardsWholeAsync(project, compilation, copy)) { broken.Add(project.AssemblyName); continue; }
-
-                var refs = await SymbolFinder.FindReferencesAsync(prop, solution, project.Documents.ToImmutableHashSet());
-                foreach (var location in refs.SelectMany(r => r.Locations))
+                var (publisherProject, publisherType) = await FindPublisherAsync(mutated, contract);
+                if (publisherProject is null || publisherType is null) continue;
+                var consumers = new List<(Project, INamedTypeSymbol)>();
+                foreach (var project in DeployableProjects(mutated).Where(p => p.AssemblyName != publisherProject.AssemblyName))
                 {
-                    var node = (await location.Document.GetSyntaxRootAsync())!.FindNode(location.Location.SourceSpan);
-                    var model = (await location.Document.GetSemanticModelAsync())!;
-                    if (IsWrite(node) || node.FirstAncestorOrSelf<TypeDeclarationSyntax>() is { } decl
-                        && SymbolEqualityComparer.Default.Equals(model.GetDeclaredSymbol(decl), prop.ContainingType))
-                        continue;
-                    if (IsInLoggingCall(node)) continue;
-                    broken.Add(project.AssemblyName);
-                    break;
+                    var comp = (await project.GetCompilationAsync())!;
+                    if (HandledEvents(comp).FirstOrDefault(t => t.Name == contract) is { } copy) consumers.Add((project, copy));
+                }
+                var wire = await _wire.RoundTripAsync(mutated, publisherType, publisherProject, consumers);
+                foreach (var (project, copy) in consumers)
+                {
+                    var r = wire[project.AssemblyName];
+                    var used = await UsedPathsAsync(mutated, project, copy);
+                    foreach (var path in used) labels.Add($"{project.AssemblyName}\t{contract}\t{path}");
+                    if (r.Throws) { truth.Add(project.AssemblyName); wireNotes.Add($"{project.AssemblyName} {contract}: throws ({r.Error})"); continue; }
+                    var hit = r.LostPaths.Where(used.Contains).ToList();
+                    if (hit.Count > 0) { truth.Add(project.AssemblyName); wireNotes.Add($"{project.AssemblyName} {contract}: lost {string.Join(",", hit)}"); }
+                    else if (r.LostPaths.Count > 0) wireNotes.Add($"{project.AssemblyName} {contract}: lost unused {string.Join(",", r.LostPaths)}");
                 }
             }
         }
-        return broken;
+
+        // Graph-based approaches: index the mutant once, run each variant against it.
+        var batch = await new CodeGraphExtractor(loaded with { Solution = mutated }).ExtractAsync();
+        batch.PruneDanglingEdges();
+        store.Replace(batch);
+        var predictions = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal)
+        {
+            ["Compiler"] = [],
+            ["grep"] = GrepBaseline(m),
+            ["Topology"] = TopologyBaseline(baseGraph, m),
+        };
+        foreach (var approach in Approaches)
+        {
+            var introduced = approach.Run(store).Where(f => !baseline[approach.Name].Contains(f.Id)).ToList();
+            predictions[approach.Name] = introduced.Select(f => f.ConsumerService).Where(_deployables.Contains).Distinct().Order().ToList();
+            if (approach.Name == "Ripple")
+                wireNotes.AddRange(introduced.Select(f => $"ripple: {f.Kind} {f.Contract} -> {f.ConsumerService} {f.Path} {f.Expected}/{f.Actual}").Distinct());
+        }
+
+        return new EvalCase(m.Label, m.Kind, truth.Order().ToList(), predictions, wireNotes);
     }
 
-    static bool Handles(Compilation compilation, INamedTypeSymbol contract) =>
-        AllTypes(compilation.Assembly.GlobalNamespace).Any(t => !t.IsAbstract && t.AllInterfaces.Any(i =>
-            i.Name == "IIntegrationEventHandler" && i.TypeArguments.Length == 1 && SymbolEqualityComparer.Default.Equals(i.TypeArguments[0], contract)));
+    /// <summary>Usage oracle: JSON paths of the consumer's copy that its code reads (SymbolFinder), or all paths if it forwards the whole event.</summary>
+    static async Task<HashSet<string>> UsedPathsAsync(Solution solution, Project project, INamedTypeSymbol copy)
+    {
+        var compilation = (await project.GetCompilationAsync())!;
+        var all = Walk(copy, "").ToList();
+        if (await ForwardsWholeAsync(project, compilation, copy)) return all.Select(x => x.Path).ToHashSet(StringComparer.Ordinal);
 
-    /// <summary>The consumer passes the whole event object to an object-typed parameter (e.g. a webhook payload).</summary>
+        var used = new HashSet<string>(StringComparer.Ordinal);
+        var documents = project.Documents.ToImmutableHashSet();
+        foreach (var (prop, path) in all)
+        {
+            foreach (var location in (await SymbolFinder.FindReferencesAsync(prop, solution, documents)).SelectMany(r => r.Locations))
+            {
+                var node = (await location.Document.GetSyntaxRootAsync())!.FindNode(location.Location.SourceSpan);
+                var model = (await location.Document.GetSemanticModelAsync())!;
+                if (IsWrite(node) || IsInLoggingCall(node)) continue;
+                if (node.FirstAncestorOrSelf<TypeDeclarationSyntax>() is { } decl
+                    && SymbolEqualityComparer.Default.Equals(model.GetDeclaredSymbol(decl), prop.ContainingType)) continue;
+                used.Add(path);
+                break;
+            }
+        }
+        return used;
+    }
+
+    // ---------------------------------------------------------------- approaches (graph variants are ablations of one pipeline)
+
+    public sealed record Approach(string Name, Func<GraphStore, IReadOnlyList<Finding>> Run);
+
+    static readonly Approach[] Approaches =
+    [
+        new("Schema diff (no READS)", Ablations.SchemaDiff),
+        new("Ripple, handler body only", g => ContractChecker.Run(g, maxHops: 0)),
+        new("Ripple", g => ContractChecker.Run(g)),
+    ];
+
+    /// <summary>grep, made fair: a consumer file that mentions both the event and the changed member.</summary>
+    IReadOnlyList<string> GrepBaseline(Mutation m)
+    {
+        var member = m.Member.Length > 0 ? m.Member : m.TypeName;
+        var memberRe = new Regex($@"\b{Regex.Escape(member)}\b");
+        var contracts = m.WirePaths.Select(p => p.Contract).Distinct().ToList();
+        var hits = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var (_, project) in loaded.Services)
+        {
+            if (project.Name == m.Project && !m.ConsumerSide) continue;
+            var dir = Path.GetDirectoryName(project.FilePath)!;
+            foreach (var file in Directory.EnumerateFiles(dir, "*.cs", SearchOption.AllDirectories).Where(f => !f.Contains("/obj/")))
+            {
+                var text = File.ReadAllText(file);
+                if (memberRe.IsMatch(text) && contracts.Any(text.Contains)) { hits.Add(project.AssemblyName); break; }
+            }
+        }
+        return hits.ToList();
+    }
+
+    /// <summary>Pub/sub topology only (what a service map knows): every other service that handles a changed contract.</summary>
+    IReadOnlyList<string> TopologyBaseline(GraphStore baseGraph, Mutation m)
+    {
+        if (m.ConsumerSide) return [];
+        var publisher = loaded.Services.First(x => x.Project.Name == m.Project).Project.AssemblyName;
+        var hits = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var contract in m.WirePaths.Select(p => p.Contract).Distinct())
+            foreach (var row in baseGraph.Query("""
+                         MATCH (h:Method)-[:HANDLES]->(:EventShape)-[:SHAPE_OF]->(:EventContract {name: $contract})
+                         RETURN DISTINCT h.service AS service
+                         """, new Dictionary<string, object?> { ["contract"] = contract }))
+                if (row["service"] is string s && s != publisher && _deployables.Contains(s))
+                    hits.Add(s);
+        return hits.ToList();
+    }
+
+    // ---------------------------------------------------------------- Roslyn helpers (no graph)
+
+    IEnumerable<Project> DeployableProjects(Solution solution) =>
+        solution.Projects.Where(p => _deployables.Contains(p.AssemblyName)).GroupBy(p => p.AssemblyName).Select(g => g.First());
+
+    async Task<(Project?, INamedTypeSymbol?)> FindPublisherAsync(Solution solution, string contract)
+    {
+        foreach (var project in DeployableProjects(solution))
+        {
+            var compilation = (await project.GetCompilationAsync())!;
+            if (!PublishedEventNames(compilation).Contains(contract)) continue;
+            var type = AllTypes(compilation.Assembly.GlobalNamespace).FirstOrDefault(t => t.Name == contract && CodeGraphExtractor.IsIntegrationEvent(t));
+            if (type is not null) return (project, type);
+        }
+        return (null, null);
+    }
+
+    /// <summary>Event types this compilation instantiates (`new X(...)`), i.e. publishes.</summary>
+    static HashSet<string> PublishedEventNames(Compilation compilation)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        // Source-generated trees (e.g. a JsonSerializerContext) instantiate events too; they don't publish anything.
+        foreach (var tree in compilation.SyntaxTrees.Where(t => File.Exists(t.FilePath) && !t.FilePath.Contains("/obj/")))
+        {
+            var model = compilation.GetSemanticModel(tree);
+            foreach (var creation in tree.GetRoot().DescendantNodes().OfType<BaseObjectCreationExpressionSyntax>())
+                if (model.GetTypeInfo(creation).Type is INamedTypeSymbol t && CodeGraphExtractor.IsIntegrationEvent(t)
+                    && SymbolEqualityComparer.Default.Equals(t.ContainingAssembly, compilation.Assembly))
+                    names.Add(t.Name);
+        }
+        return names;
+    }
+
+    static IEnumerable<INamedTypeSymbol> HandledEvents(Compilation compilation) =>
+        AllTypes(compilation.Assembly.GlobalNamespace)
+            .Where(t => !t.IsAbstract)
+            .SelectMany(t => t.AllInterfaces)
+            .Where(i => i.Name == "IIntegrationEventHandler" && i.TypeArguments.Length == 1)
+            .Select(i => (INamedTypeSymbol)i.TypeArguments[0])
+            .Distinct<INamedTypeSymbol>(SymbolEqualityComparer.Default);
+
+    /// <summary>The consumer passes its copy of the event to an object-typed parameter (e.g. a webhook payload).</summary>
     static async Task<bool> ForwardsWholeAsync(Project project, Compilation compilation, INamedTypeSymbol contract)
     {
         foreach (var document in project.Documents)
@@ -226,77 +382,52 @@ public sealed class MutationEval(LoadedSolution loaded, GraphStore store, Action
             foreach (var arg in root.DescendantNodes().OfType<ArgumentSyntax>())
             {
                 if (!SymbolEqualityComparer.Default.Equals(model.GetTypeInfo(arg.Expression).Type, contract) || IsInLoggingCall(arg)) continue;
-                if (model.GetSymbolInfo(arg.Parent!.Parent!).Symbol is IMethodSymbol m)
+                if (model.GetSymbolInfo(arg.Parent!.Parent!).Symbol is IMethodSymbol method)
                 {
                     var index = ((BaseArgumentListSyntax)arg.Parent).Arguments.IndexOf(arg);
-                    if (index < m.Parameters.Length && m.Parameters[index].Type.SpecialType == SpecialType.System_Object) return true;
+                    if (index < method.Parameters.Length && method.Parameters[index].Type.SpecialType == SpecialType.System_Object) return true;
                 }
             }
         }
         return false;
     }
 
-    // ---------------------------------------------------------------- baselines
-
-    /// <summary>"Diff + grep": any consumer service whose source mentions the old property name as a word.</summary>
-    HashSet<string> GrepBaseline(Target target, HashSet<string> deployables)
-    {
-        var word = new Regex($@"\b{Regex.Escape(target.PropertyName)}\b");
-        var hits = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var (_, project) in loaded.Services)
-        {
-            if (project.AssemblyName == target.PublisherService || !deployables.Contains(project.AssemblyName)) continue;
-            var dir = Path.GetDirectoryName(project.FilePath)!;
-            if (Directory.EnumerateFiles(dir, "*.cs", SearchOption.AllDirectories)
-                .Where(f => !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}"))
-                .Any(f => word.IsMatch(File.ReadAllText(f))))
-                hits.Add(project.AssemblyName);
-        }
-        return hits;
-    }
-
-    /// <summary>
-    /// Ablation: the same graph without the contract layer. From every method that creates the event, follow CALLS
-    /// (syntactic, MediatR, domain-event and interface dispatch) and report other services reached.
-    /// </summary>
-    static HashSet<string> CallGraphBaseline(GraphStore baseGraph, Target target, HashSet<string> deployables)
-    {
-        var hits = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var contract in target.WirePaths.Select(p => p.Contract).Distinct())
-        {
-            var rows = baseGraph.Query("""
-                MATCH (pub:Method)-[:PUBLISHES]->(:EventShape {name: $contract, service: $service})
-                MATCH (pub)-[:CALLS*1..8]->(m:Method)
-                WHERE m.service <> $service
-                RETURN DISTINCT m.service AS service
-                """, new Dictionary<string, object?> { ["contract"] = contract, ["service"] = target.PublisherService });
-            foreach (var r in rows)
-                if (r["service"] is string s && deployables.Contains(s)) hits.Add(s);
-        }
-        return hits;
-    }
-
-    // ---------------------------------------------------------------- helpers
-
     static IEnumerable<INamedTypeSymbol> AllTypes(INamespaceSymbol ns)
     {
         foreach (var t in ns.GetTypeMembers())
-        {
-            yield return t;
-            foreach (var nested in t.GetTypeMembers()) yield return nested;
-        }
+            foreach (var x in WithNested(t)) yield return x;
         foreach (var child in ns.GetNamespaceMembers())
             foreach (var t in AllTypes(child)) yield return t;
     }
 
-    static IEnumerable<IPropertySymbol> SerializedProperties(ITypeSymbol type)
+    static IEnumerable<INamedTypeSymbol> WithNested(INamedTypeSymbol t)
+    {
+        yield return t;
+        foreach (var n in t.GetTypeMembers())
+            foreach (var x in WithNested(n)) yield return x;
+    }
+
+    /// <summary>(property, JSON path) pairs, honouring [JsonPropertyName] and [JsonIgnore].</summary>
+    static IEnumerable<(IPropertySymbol Prop, string Path)> Walk(ITypeSymbol type, string prefix, int depth = 0)
     {
         var seen = new HashSet<string>(StringComparer.Ordinal);
         for (var t = type; t is not null && t.SpecialType != SpecialType.System_Object; t = t.BaseType)
+        {
             foreach (var p in t.GetMembers().OfType<IPropertySymbol>())
-                if (!p.IsStatic && !p.IsIndexer && p.GetMethod is not null && p.Name != "EqualityContract"
-                    && p.DeclaredAccessibility == Accessibility.Public && seen.Add(p.Name))
-                    yield return p;
+            {
+                if (p.IsStatic || p.IsIndexer || p.GetMethod is null || p.Name == "EqualityContract" || !seen.Add(p.Name)) continue;
+                if (p.DeclaredAccessibility != Accessibility.Public && !p.GetAttributes().Any(a => a.AttributeClass?.Name == "JsonIncludeAttribute")) continue;
+                if (p.GetAttributes().Any(a => a.AttributeClass?.Name == "JsonIgnoreAttribute")) continue;
+                var wire = p.GetAttributes().FirstOrDefault(a => a.AttributeClass?.Name == "JsonPropertyNameAttribute")?.ConstructorArguments[0].Value as string ?? p.Name;
+                var path = prefix + wire;
+                yield return (p, path);
+                var element = ElementType(p.Type);
+                var value = element ?? p.Type;
+                if (depth < 4 && value.TypeKind is TypeKind.Class or TypeKind.Struct && value.SpecialType == SpecialType.None && value.Locations.Any(l => l.IsInSource))
+                    foreach (var inner in Walk(value, path + (element is null ? "." : "[]."), depth + 1))
+                        yield return inner;
+            }
+        }
     }
 
     static ITypeSymbol? ElementType(ITypeSymbol type)
@@ -319,42 +450,58 @@ public sealed class MutationEval(LoadedSolution loaded, GraphStore store, Action
         && name.StartsWith("Log", StringComparison.Ordinal);
 }
 
-public sealed record EvalCase(
-    string Mutation, string Kind, string PublisherService, IReadOnlyList<string> Truth,
-    IReadOnlyList<string> Compiler, IReadOnlyList<string> Grep, IReadOnlyList<string> CallGraph, IReadOnlyList<string> Ripple,
-    IReadOnlyList<string> RippleFindings);
-
-public sealed record EvalReport(IReadOnlyList<EvalCase> Cases)
+/// <summary>Graph ablations that are not part of the product.</summary>
+static class Ablations
 {
-    public sealed record Score(string Approach, int TruePositives, int FalsePositives, int FalseNegatives, int BreaksCaught, int Breaks, int ControlsFlagged, int Controls)
+    /// <summary>
+    /// Schema-registry style: a consumer is affected when its copy declares a path the publisher no longer sends, or a
+    /// path with a drifted type, or its contract is no longer published — whether or not its code uses the field.
+    /// </summary>
+    public static IReadOnlyList<Finding> SchemaDiff(GraphStore g)
     {
-        public double Precision => TruePositives + FalsePositives == 0 ? 1 : (double)TruePositives / (TruePositives + FalsePositives);
+        const string missing = """
+            MATCH (pub:Method)-[:PUBLISHES]->(ps:EventShape)-[:SHAPE_OF]->(c:EventContract)<-[:SHAPE_OF]-(cs:EventShape)<-[:HANDLES]-(h:Method)
+            WHERE ps <> cs
+            WITH pub, ps, c, cs, h
+            MATCH (cs)-[:HAS_PROPERTY]->(cp:Property)
+            WHERE NOT (ps)-[:HAS_PROPERTY]->(:Property {path: cp.path})
+            RETURN DISTINCT 'schema-missing' AS kind, c.name AS contract, pub.service AS publisherService, null AS publisher,
+                   h.service AS consumerService, null AS handler, null AS reader, cp.path AS path, null AS expected, null AS actual
+            """;
+        var findings = g.Query(missing).Select(r => Finding.FromRow(r, "schema diff", "n/a")).ToList();
+        var p = new Dictionary<string, object?> { ["contract"] = null, ["compatible"] = Queries.RippleQueries.Compatible.Cast<object>().ToList() };
+        findings.AddRange(g.Query(Queries.RippleQueries.TypeDrift, p).Select(r => Finding.FromRow(r, "schema diff", "n/a")));
+        findings.AddRange(g.Query(Queries.RippleQueries.StarvedSubscriptions, p).Select(r => Finding.FromRow(r, "schema diff", "n/a")));
+        return findings;
+    }
+}
+
+public sealed record EvalCase(string Mutation, string Kind, IReadOnlyList<string> Truth,
+    IReadOnlyDictionary<string, IReadOnlyList<string>> Predictions, IReadOnlyList<string> WireNotes);
+
+public sealed record EvalReport(IReadOnlyList<EvalCase> Cases, IReadOnlyList<string> UsageLabels)
+{
+    public static readonly string[] ApproachOrder = ["Compiler", "grep", "Topology", "Schema diff (no READS)", "Ripple, handler body only", "Ripple"];
+
+    public sealed record Score(string Approach, string Kind, int TruePositives, int FalsePositives, int FalseNegatives, int Exact, int Cases)
+    {
+        public double? Precision => TruePositives + FalsePositives == 0 ? null : (double)TruePositives / (TruePositives + FalsePositives);
         public double Recall => TruePositives + FalseNegatives == 0 ? 1 : (double)TruePositives / (TruePositives + FalseNegatives);
     }
 
-    public IReadOnlyList<Score> Scores()
+    public IReadOnlyList<Score> Scores(string? kind = null) => ApproachOrder.Select(a =>
     {
-        var approaches = new (string Name, Func<EvalCase, IReadOnlyList<string>> Pick)[]
+        int tp = 0, fp = 0, fn = 0, exact = 0, n = 0;
+        foreach (var c in Cases.Where(c => kind is null || c.Kind == kind))
         {
-            ("Compiler (dotnet build)", c => c.Compiler),
-            ("grep for the property name", c => c.Grep),
-            ("Call graph only (no contract layer)", c => c.CallGraph),
-            ("Ripple (contract graph)", c => c.Ripple),
-        };
-        return approaches.Select(a =>
-        {
-            int tp = 0, fp = 0, fn = 0, caught = 0, breaks = 0, controlsFlagged = 0, controls = 0;
-            foreach (var c in Cases)
-            {
-                var predicted = a.Pick(c).ToHashSet();
-                var truth = c.Truth.ToHashSet();
-                tp += predicted.Count(truth.Contains);
-                fp += predicted.Count(p => !truth.Contains(p));
-                fn += truth.Count(t => !predicted.Contains(t));
-                if (truth.Count > 0) { breaks++; if (truth.SetEquals(predicted)) caught++; }
-                if (c.Kind == "rename-keep") { controls++; if (predicted.Count > 0) controlsFlagged++; }
-            }
-            return new Score(a.Name, tp, fp, fn, caught, breaks, controlsFlagged, controls);
-        }).ToList();
-    }
+            var predicted = c.Predictions[a].ToHashSet();
+            var truth = c.Truth.ToHashSet();
+            tp += predicted.Count(truth.Contains);
+            fp += predicted.Count(x => !truth.Contains(x));
+            fn += truth.Count(x => !predicted.Contains(x));
+            n++;
+            if (predicted.SetEquals(truth)) exact++;
+        }
+        return new Score(a, kind ?? "all", tp, fp, fn, exact, n);
+    }).ToList();
 }
